@@ -28,7 +28,5 @@ class WidowAIFollowerConfig(RobotConfig):
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     
-    # Enable effort sensing to include effort observations
-    # NOTE: this is not truly effort estimation, and it's torque estimation from motor current feedback on each joint
-    #       but we refer to it as "effort" to be consistent with Trossen's documentation
+    # Enable effort sensing to include effort measurements in observations
     effort_sensing: bool = False
