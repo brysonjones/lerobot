@@ -158,6 +158,11 @@ def teleop_loop(
         # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
         _ = robot.send_action(robot_action_to_send)
 
+        # Force feedback
+        force_feedback = {key: val for key, val in obs.items() if key.endswith(".force")}
+        if force_feedback:
+            teleop.send_feedback(force_feedback)
+
         if display_data:
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)

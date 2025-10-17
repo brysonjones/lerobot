@@ -7,12 +7,6 @@ import trossen_arm as trossen
 
 
 class TrossenArmDriver:
-    """
-    Simple, direct interface for Trossen Robotics' robotic arms.
-    
-    This is a simplified implementation that directly uses the trossen_arm library.
-    """
-
     def __init__(
         self,
         port: str,
