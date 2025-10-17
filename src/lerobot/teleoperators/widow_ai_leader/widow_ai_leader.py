@@ -35,7 +35,7 @@ class WidowAILeader(Teleoperator):
 
     @property
     def feedback_features(self) -> dict[str, type]:
-        return {f"{motor}.force": float for motor in self.motor_names}
+        return {f"{motor}.effort": float for motor in self.motor_names}
 
     @property
     def is_connected(self) -> bool:
@@ -79,18 +79,18 @@ class WidowAILeader(Teleoperator):
         return action
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        """Send force feedback to the leader arm."""
-        force_feedback = []
+        """Send effort feedback to the leader arm."""
+        effort_feedback = []
         for motor in self.motor_names:
-            force_key = f"{motor}.force"
-            if force_key in feedback:
-                force_feedback.append(-1 * self.config.force_feedback_gain * feedback[force_key])
+            effort_key = f"{motor}.effort"
+            if effort_key in feedback:
+                effort_feedback.append(-1 * self.config.effort_feedback_gain * feedback[effort_key])
             else:
-                force_feedback.append(0.0)
-        
-        if force_feedback:
-            self.bus.write("External_Efforts", force_feedback)
-            logger.debug(f"{self} sent force feedback: {force_feedback}")
+                effort_feedback.append(0.0)
+
+        if effort_feedback:
+            self.bus.write("External_Efforts", effort_feedback)
+            logger.debug(f"{self} sent effort feedback: {effort_feedback}")
 
     def disconnect(self) -> None:
         if not self.is_connected:

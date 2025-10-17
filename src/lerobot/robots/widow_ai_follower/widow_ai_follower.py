@@ -39,8 +39,8 @@ class WidowAIFollower(Robot):
         return {f"{motor}.pos": float for motor in self.motor_names}
 
     @property
-    def _forces_ft(self) -> dict[str, type]:
-        return {f"{motor}.force": float for motor in self.motor_names}
+    def _efforts_ft(self) -> dict[str, type]:
+        return {f"{motor}.effort": float for motor in self.motor_names}
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -50,8 +50,8 @@ class WidowAIFollower(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        if self.config.force_sensing:
-            return {**self._motors_ft, **self._forces_ft, **self._cameras_ft}
+        if self.config.effort_sensing:
+            return {**self._motors_ft, **self._efforts_ft, **self._cameras_ft}
         else:
             return {**self._motors_ft, **self._cameras_ft}
 
@@ -111,23 +111,23 @@ class WidowAIFollower(Robot):
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
-        if self.config.force_sensing:
+        if self.config.effort_sensing:
             try:
                 start = time.perf_counter()
                 efforts = self.bus.read("External_Efforts")
                 dt_ms = (time.perf_counter() - start) * 1e3
                 logger.debug(f"{self} read external efforts: {dt_ms:.1f}ms")
-                
+
                 # Convert numpy array to dict with motor names
                 for i, motor in enumerate(self.motor_names):
                     if i < len(efforts):
-                        obs_dict[f"{motor}.force"] = float(efforts[i])
+                        obs_dict[f"{motor}.effort"] = float(efforts[i])
                     else:
-                        obs_dict[f"{motor}.force"] = 0.0
+                        obs_dict[f"{motor}.effort"] = 0.0
             except Exception as e:
                 logger.debug(f"{self} failed to read external efforts, using zeros: {e}")
                 for motor in self.motor_names:
-                    obs_dict[f"{motor}.force"] = 0.0
+                    obs_dict[f"{motor}.effort"] = 0.0
 
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():

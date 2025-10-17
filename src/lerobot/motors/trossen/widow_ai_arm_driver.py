@@ -141,14 +141,14 @@ class TrossenArmDriver:
         logging.debug(f"Setting {self.model} arm mode for teleoperation...")
         if is_leader:
             self.driver.set_all_modes(trossen.Mode.external_effort)
-            # Send zero forces immediately to prevent instability
-            logging.debug(f"Sending zero forces to {self.model} arm for stability...")
+            # Send zero efforts immediately to prevent instability
+            logging.debug(f"Sending zero efforts to {self.model} arm for stability...")
             try:
-                zero_forces = [0.0] * self.driver.get_num_joints()
-                self.driver.set_all_external_efforts(zero_forces, 0.0, False)
-                logging.debug(f"Zero forces sent to {self.model} arm - should be stable now")
+                zero_efforts = [0.0] * self.driver.get_num_joints()
+                self.driver.set_all_external_efforts(zero_efforts, 0.0, False)
+                logging.debug(f"Zero efforts sent to {self.model} arm - should be stable now")
             except Exception as e:
-                logging.warning(f"Failed to send zero forces to {self.model} arm: {e}")
+                logging.warning(f"Failed to send zero efforts to {self.model} arm: {e}")
         else:
             self.driver.set_all_modes(trossen.Mode.position)
 
