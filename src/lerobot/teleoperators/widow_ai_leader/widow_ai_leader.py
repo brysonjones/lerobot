@@ -23,6 +23,7 @@ class WidowAILeader(Teleoperator):
         self.bus = TrossenArmDriver(
             port=self.config.port,
             model=self.config.model,
+            velocity_limit_scale=self.config.velocity_limit_scale,
         )
         
         # Define motor names for compatibility

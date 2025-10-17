@@ -11,9 +11,11 @@ class TrossenArmDriver:
         self,
         port: str,
         model: str = "V0_LEADER",
+        velocity_limit_scale: float | None = None,
     ):
         self.port = port
         self.model = model
+        self.velocity_limit_scale = velocity_limit_scale
         self.driver = None
         self.is_connected = False
 
@@ -38,18 +40,18 @@ class TrossenArmDriver:
         except KeyError as e:
             raise ValueError(f"Unsupported model: {self.model}") from e
 
-    def _reduce_velocity_limits(self, amount: float = 0.001) -> None:
-        logging.debug(f"Reducing {self.model} arm velocity limits by {amount * 100}% for safety...")
+    def _scale_velocity_limits(self, scale: float) -> None:
+        logging.debug(f"Scaling {self.model} arm velocity limits to {scale * 100}% for safety...")
 
         joint_limits = self.driver.get_joint_limits()
 
         for i in range(len(joint_limits)):
             original_velocity = joint_limits[i].velocity_max
-            joint_limits[i].velocity_max *= (1 - amount)
-            logging.debug(f"  Joint {i}: velocity_max reduced from {original_velocity:.3f} to {joint_limits[i].velocity_max:.3f}")
+            joint_limits[i].velocity_max *= scale
+            logging.debug(f"  Joint {i}: velocity_max scaled from {original_velocity:.3f} to {joint_limits[i].velocity_max:.3f}")
 
         self.driver.set_joint_limits(joint_limits)
-        logging.debug(f"{self.model} arm velocity limits successfully reduced.")
+        logging.debug(f"{self.model} arm velocity limits successfully scaled.")
 
     def connect(self) -> None:
         if self.is_connected:
@@ -73,7 +75,8 @@ class TrossenArmDriver:
 
         self.is_connected = True
 
-        self._reduce_velocity_limits()
+        if self.velocity_limit_scale is not None:
+            self._scale_velocity_limits(self.velocity_limit_scale)
 
     def disconnect(self) -> None:
         if not self.is_connected:

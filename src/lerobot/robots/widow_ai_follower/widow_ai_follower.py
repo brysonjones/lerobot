@@ -27,6 +27,7 @@ class WidowAIFollower(Robot):
         self.bus = TrossenArmDriver(
             port=self.config.port,
             model=self.config.model,
+            velocity_limit_scale=self.config.velocity_limit_scale,
         )
         
         self.motor_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_1", "wrist_2", "wrist_3", "gripper"]

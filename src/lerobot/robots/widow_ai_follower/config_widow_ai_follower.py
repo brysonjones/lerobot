@@ -14,7 +14,11 @@ class WidowAIFollowerConfig(RobotConfig):
     port: str
     
     # Trossen arm model to use
-    model: str = "V0_FOLLOWER"
+    model: str = "V0_FOLLOWER"  # Options: "V0_LEADER", "V0_FOLLOWER"
+
+    # Velocity limit scale for safety (1.0 = 100% of max velocity, 0.5 = 50% of max velocity)
+    # Scales maximum joint velocities on connection. Set to None to skip scaling.
+    velocity_limit_scale: float | None = None
 
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.
     # Set this to a positive scalar to have the same value for all motors, or a list that is the same length as
