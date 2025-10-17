@@ -24,7 +24,6 @@ class WidowAIFollower(Robot):
         super().__init__(config)
         self.config = config
         
-        # Use simplified TrossenArmDriver
         self.bus = TrossenArmDriver(
             port=self.config.port,
             model=self.config.model,
@@ -64,10 +63,6 @@ class WidowAIFollower(Robot):
         return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
 
     def connect(self, calibrate: bool = True) -> None:
-        """
-        We assume that at connection time, arm is in a rest position,
-        and torque can be safely disabled to run calibration.
-        """
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 

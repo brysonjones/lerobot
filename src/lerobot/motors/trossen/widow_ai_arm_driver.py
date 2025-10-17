@@ -1,5 +1,4 @@
 import logging
-import time
 import traceback
 from typing import List, Union
 
@@ -12,20 +11,13 @@ class TrossenArmDriver:
         self,
         port: str,
         model: str = "V0_LEADER",
-        mock: bool = False,
     ):
         self.port = port
         self.model = model
-        self.mock = mock
         self.driver = None
         self.is_connected = False
-        self.logs = {}
-        self.fps = 30
-        
-        self.home_pose = [0.0, np.pi/2, np.pi/2, 0.0, 0.0, 0.0, 0.0]
-        self.sleep_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        
-        self.MIN_TIME_TO_MOVE = 3.0 / self.fps
+
+        self.MIN_TIME_TO_MOVE = 0.1  # seconds
 
     @property
     def is_connected(self) -> bool:
@@ -68,10 +60,7 @@ class TrossenArmDriver:
 
         self.driver = trossen.TrossenArmDriver()
 
-        try:
-            model_name, model_end_effector = self._get_model_config()
-        except Exception as e:
-            raise e
+        model_name, model_end_effector = self._get_model_config()
 
         logging.debug("Configuring the drivers...")
 
@@ -96,8 +85,6 @@ class TrossenArmDriver:
         if not self.is_connected:
             raise RuntimeError(f"TrossenArmDriver({self.port}) is not connected. You need to run `connect()`.")
 
-        start_time = time.perf_counter()
-
         if data_name == "Present_Position":
             values = self.driver.get_all_positions()
         elif data_name == "External_Efforts":
@@ -105,35 +92,20 @@ class TrossenArmDriver:
         else:
             raise ValueError(f"Data name: {data_name} is not supported for reading.")
 
-        self.logs["delta_timestamp_s_read"] = time.perf_counter() - start_time
         return np.array(values, dtype=np.float32)
 
     def write(self, data_name: str, values: Union[float, List[float], np.ndarray]) -> None:
         if not self.is_connected:
             raise RuntimeError(f"TrossenArmDriver({self.port}) is not connected. You need to run `connect()`.")
 
-        start_time = time.perf_counter()
-
         if data_name == "Goal_Position":
             values = np.array(values, dtype=np.float32)
             self.driver.set_all_positions(values.tolist(), self.MIN_TIME_TO_MOVE, False)
-        elif data_name == "Torque_Enable":
-            if values == 1:
-                self.driver.set_all_modes(trossen.Mode.position)
-            else:
-                self.driver.set_all_modes(trossen.Mode.external_effort)
         elif data_name == "External_Efforts":
             values = np.array(values, dtype=np.float32)
             self.driver.set_all_external_efforts(values.tolist(), 0.0, False)
-        elif data_name == "Reset":
-            self.driver.set_all_modes(trossen.Mode.velocity)
-            self.driver.set_all_velocities([0.0] * self.driver.get_num_joints(), 0.0, False)
-            self.driver.set_all_modes(trossen.Mode.position)
-            self.driver.set_all_positions(self.home_pose, 2.0, False)
         else:
             raise ValueError(f"Data name: {data_name} is not supported for writing.")
-
-        self.logs["delta_timestamp_s_write"] = time.perf_counter() - start_time
 
     def initialize_for_teleoperation(self, is_leader: bool = True) -> None:
         logging.debug(f"Initializing {self.model} arm for teleoperation...")

@@ -16,8 +16,6 @@ class WidowAIFollowerConfig(RobotConfig):
     # Trossen arm model to use
     model: str = "V0_FOLLOWER"
 
-    disable_torque_on_disconnect: bool = True
-
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.
     # Set this to a positive scalar to have the same value for all motors, or a list that is the same length as
     # the number of motors in your follower arms.
@@ -25,9 +23,6 @@ class WidowAIFollowerConfig(RobotConfig):
 
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
-
-    # Set to `True` for backward compatibility with previous policies/dataset
-    use_degrees: bool = False
     
     # Enable effort sensing to include effort observations
     # NOTE: this is not truly effort estimation, and it's torque estimation from motor current feedback on each joint

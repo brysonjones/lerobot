@@ -20,7 +20,6 @@ class WidowAILeader(Teleoperator):
         super().__init__(config)
         self.config = config
         
-        # Use simplified TrossenArmDriver
         self.bus = TrossenArmDriver(
             port=self.config.port,
             model=self.config.model,
