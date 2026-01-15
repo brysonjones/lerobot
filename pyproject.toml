@@ -475,4 +475,8 @@ conflicts = [
         { extra = "pi" },
         { extra = "all" },
     ],
+    [
+        { extra = "multi_task_dit" },
+        { extra = "pi" },
+    ]
 ]
