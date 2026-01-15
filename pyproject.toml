@@ -420,7 +420,7 @@ conflicts = [
     ],
     [
         { extra = "wallx" },
-        { extra = "multi-task-dit" },
+        { extra = "multi_task_dit" },
     ],
     [
         { extra = "wallx" },
@@ -458,6 +458,10 @@ conflicts = [
     [
         { extra = "pi" },
         { extra = "hilserl" },
+    ],
+    [
+        { extra = "pi" },
+        { extra = "multi_task_dit" },
     ],
     [
         { extra = "pi" },
