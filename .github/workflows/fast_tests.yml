@@ -86,10 +86,16 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Use 'uv pip install' instead of 'uv sync' to avoid resolving ALL extras.
+      # This prevents timeout/failure from resolving conflicting git dependencies
+      # like the 'pi' extra which requires cloning a transformers git branch.
       - name: Install lerobot with test extras
         run: |
           uv venv
-          uv pip install ".[test]"
+          uv pip install -e ".[test]"
 
+      # Use the venv directly instead of 'uv run' to avoid triggering sync
       - name: Run pytest
-        run: uv run pytest tests -vv --maxfail=10
+        run: |
+          source .venv/bin/activate
+          pytest tests -vv --maxfail=10
