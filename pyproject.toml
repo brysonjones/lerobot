@@ -460,10 +460,6 @@ conflicts = [
         { extra = "hilserl" },
     ],
     [
-        { extra = "multi_task_dit" },
-        { extra = "pi" },
-    ],
-    [
         { extra = "pi" },
         { extra = "libero" },
     ],
