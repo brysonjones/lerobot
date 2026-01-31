@@ -43,7 +43,7 @@ permissions:
 
 # Sets up the environment variables
 env:
-  UV_VERSION: "0.9.28"
+  UV_VERSION: "0.8.0"
   PYTHON_VERSION: "3.10"
 
 # Ensures that only the latest commit for a PR or branch is built, canceling older runs.
@@ -106,6 +106,7 @@ jobs:
           ) &
           HB_PID=$!
           trap 'kill $HB_PID || true' EXIT
+          export UV_MAX_JOBS=2
           uv sync --extra "test"
 
       - name: Run pytest
