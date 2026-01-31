@@ -89,7 +89,21 @@ jobs:
       - name: Install lerobot with test extras
         run: |
           set -euo pipefail
-          ( while true; do echo "[heartbeat] still resolving deps..."; sleep 60; done ) &
+
+          (
+            while true; do
+              echo "===== heartbeat $(date) ====="
+
+              echo "--- memory ---"
+              free -h || true
+
+              echo "--- disk ---"
+              df -h || true
+
+              echo "============================="
+              sleep 60
+            done
+          ) &
           HB_PID=$!
           trap 'kill $HB_PID || true' EXIT
           uv sync --extra "test"
