@@ -107,6 +107,8 @@ jobs:
           HB_PID=$!
           trap 'kill $HB_PID || true' EXIT
           export UV_MAX_JOBS=2
+          export UV_CONCURRENT_DOWNLOADS=1
+          export UV_CONCURRENT_INSTALLS=1
           uv sync --extra "test"
 
       - name: Run pytest
