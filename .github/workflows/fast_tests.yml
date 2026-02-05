@@ -45,6 +45,7 @@ permissions:
 env:
   UV_VERSION: "0.8.0"
   PYTHON_VERSION: "3.10"
+  DOCKER_IMAGE_NAME: huggingface/lerobot-gpu
 
 # Ensures that only the latest commit for a PR or branch is built, canceling older runs.
 concurrency:
@@ -59,18 +60,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MUJOCO_GL: egl
-      HF_HOME: /mnt/cache/.cache/huggingface
-      HF_LEROBOT_HOME: /mnt/cache/.cache/huggingface/lerobot
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
           lfs: true
-
-      # NOTE(Steven): Mount to `/mnt` to avoid the limited storage on `/home`. Consider cleaning default SDKs or using self-hosted runners for more space.
-      # (As of 2024-06-10, the runner's `/home` has only 6.2 GB free—8% of its 72 GB total.)
-      - name: Setup /mnt storage
-        run: sudo chown -R $USER:$USER /mnt
 
       # TODO(Steven): Evaluate the need of these dependencies
       - name: Install apt dependencies
@@ -87,29 +81,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install lerobot with test extras
-        run: |
-          set -euo pipefail
-
-          (
-            while true; do
-              echo "===== heartbeat $(date) ====="
-
-              echo "--- memory ---"
-              free -h || true
-
-              echo "--- disk ---"
-              df -h || true
-
-              echo "============================="
-              sleep 60
-            done
-          ) &
-          HB_PID=$!
-          trap 'kill $HB_PID || true' EXIT
-          export UV_MAX_JOBS=2
-          export UV_CONCURRENT_DOWNLOADS=1
-          export UV_CONCURRENT_INSTALLS=1
-          uv sync --extra "test"
+        env:
+          UV_CONCURRENCY: 1
+        run: uv sync --extra "test"
 
       - name: Run pytest
         run: uv run pytest tests -vv --maxfail=10
