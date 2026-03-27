@@ -18,7 +18,7 @@ import logging
 from functools import cached_property
 
 from lerobot.teleoperators.so_leader import SOLeaderTeleopConfig
-from lerobot.utils.errors import DeviceNotConnectedError
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..so_leader import SOLeader
 from ..teleoperator import Teleoperator
@@ -72,6 +72,7 @@ class BiSOLeader(Teleoperator):
     def is_connected(self) -> bool:
         return self.left_arm.is_connected and self.right_arm.is_connected
 
+    @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.left_arm.connect(calibrate)
         self.right_arm.connect(calibrate)
@@ -92,10 +93,8 @@ class BiSOLeader(Teleoperator):
         self.left_arm.setup_motors()
         self.right_arm.setup_motors()
 
+    @check_if_not_connected
     def get_action(self) -> dict[str, float]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
         action_dict = {}
 
         # Add "left_" prefix
@@ -112,6 +111,7 @@ class BiSOLeader(Teleoperator):
         # TODO: Implement force feedback
         raise NotImplementedError
 
+    @check_if_not_connected
     def disconnect(self) -> None:
         self.left_arm.disconnect()
         self.right_arm.disconnect()
