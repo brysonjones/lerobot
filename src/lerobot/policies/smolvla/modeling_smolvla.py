@@ -73,6 +73,7 @@ from ..common.vla_utils import (
 from ..pretrained import PreTrainedPolicy
 from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import (
+    embed_images_batched,
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
@@ -558,27 +559,28 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
+        # The special tokens are the same for every camera, so they are embedded once rather than
+        # once per camera, and the cameras share one encoder, so they go through it in one batch.
+        image_start_token = image_end_token = None
+        if self.add_image_special_tokens and len(images) > 0:
+            device = self.vlm_with_expert.vlm.device
+            image_start_token = self.vlm_with_expert.embed_language_tokens(
+                self.global_image_start_token.to(device=device)
+            ).unsqueeze(0)
+            image_end_token = self.vlm_with_expert.embed_language_tokens(
+                self.image_end_token.to(device=device)
+            ).unsqueeze(0)
+        img_embs = embed_images_batched(self.vlm_with_expert.embed_image, list(images))
+
+        for _img_idx, (img, img_mask, img_emb) in enumerate(zip(images, img_masks, img_embs, strict=False)):
             if self.add_image_special_tokens:
-                image_start_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
-                )
+                start_token = image_start_token.expand(img.shape[0], -1, -1)
                 image_start_mask = torch.ones_like(
-                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
+                    start_token[:, :, 0], dtype=torch.bool, device=start_token.device
                 )
                 att_masks += [0] * (image_start_mask.shape[-1])
-                embs.append(image_start_token)
+                embs.append(start_token)
                 pad_masks.append(image_start_mask)
-
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -592,17 +594,11 @@ class VLAFlowMatching(nn.Module):
 
             att_masks += [0] * (num_img_embs)
             if self.add_image_special_tokens:
-                image_end_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
-                )
+                end_token = image_end_token.expand(img.shape[0], -1, -1)
                 image_end_mask = torch.ones_like(
-                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
+                    end_token[:, :, 0], dtype=torch.bool, device=end_token.device
                 )
-                embs.append(image_end_token)
+                embs.append(end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)

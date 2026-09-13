@@ -65,6 +65,7 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from ..utils import embed_images_batched
 from .configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
 
 
@@ -492,13 +493,14 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks = []
         att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # Process images. The cameras share one encoder, so they go through it in one batch.
+        def image_embed_func(img):
+            return self.paligemma_with_expert.embed_image(img)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+        img_embs = embed_images_batched(
+            lambda img: self._apply_checkpoint(image_embed_func, img), list(images)
+        )
+        for img_emb, img_mask in zip(img_embs, img_masks, strict=True):
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)

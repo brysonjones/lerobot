@@ -16,10 +16,11 @@
 
 import logging
 from collections import deque
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.lerobot_types import PolicyAction, RobotAction, RobotObservation
@@ -255,3 +256,43 @@ def validate_visual_features_consistency(
 
     if not (policy_subset_of_dataset or dataset_subset_of_policy):
         raise_feature_mismatch_error(provided_visuals, expected_visuals)
+
+
+def embed_images_batched(embed: Callable[[Tensor], Tensor], images: Sequence[Tensor]) -> list[Tensor]:
+    """Embed one batch of images per camera, sending same-shaped cameras through `embed` together.
+
+    The cameras of a policy share one image encoder, so calling it once per camera runs the same
+    weights over `len(images)` separate batches. At the batch sizes these policies train at, that
+    stack is launch-bound and the split costs close to its full share of the step. Cameras of the
+    same resolution are concatenated on the batch axis and embedded in one call; a resolution change
+    starts a new call.
+
+    Args:
+        embed (`Callable[[torch.Tensor], torch.Tensor]`):
+            The image encoder, mapping `(B, ...)` to `(B, T, D)`. It must be independent across the
+            batch axis, which is what makes concatenating cameras equivalent to embedding them
+            separately.
+        images (`Sequence[torch.Tensor]`):
+            One batch of images per camera, each with the same batch size.
+
+    Returns:
+        `list[torch.Tensor]`: One embedding per camera, in the order the cameras were given.
+    """
+    if len(images) < 2:
+        return [embed(image) for image in images]
+
+    groups: list[list[Tensor]] = []
+    for image in images:
+        if groups and groups[-1][0].shape == image.shape:
+            groups[-1].append(image)
+        else:
+            groups.append([image])
+
+    embeddings: list[Tensor] = []
+    for group in groups:
+        if len(group) == 1:
+            embeddings.append(embed(group[0]))
+            continue
+        embedded = embed(torch.cat(group, dim=0))
+        embeddings.extend(embedded.chunk(len(group), dim=0))
+    return embeddings

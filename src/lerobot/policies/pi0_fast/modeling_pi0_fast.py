@@ -59,6 +59,7 @@ from lerobot.utils.constants import (
 from ..common.vla_utils import pad_vector, prepare_attention_masks_4d, resize_with_pad_torch
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from ..utils import embed_images_batched
 from .configuration_pi0_fast import PI0FastConfig
 
 
@@ -307,13 +308,14 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         total_t_images = 0
         num_fast_embs = 0
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # Process images. The cameras share one encoder, so they go through it in one batch.
+        def image_embed_func(img):
+            return self.paligemma_with_expert.embed_image(img)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+        img_embs = embed_images_batched(
+            lambda img: self._apply_checkpoint(image_embed_func, img), list(images)
+        )
+        for img_emb, img_mask in zip(img_embs, img_masks, strict=True):
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)

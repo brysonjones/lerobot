@@ -63,6 +63,7 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from ..utils import embed_images_batched
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from .memory import encode_video_with_mem, sample_observation_history
 
@@ -614,19 +615,28 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks = []
         att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # Process images. Plain camera batches share one encoder and go through it together; an
+        # observation history (5D) carries its own frame mask per camera, so it keeps its own call.
+        def image_embed_func(img, img_mask):
+            if img.ndim == 5:
+                return self.paligemma_with_expert.embed_image(
+                    img,
+                    frame_mask=img_mask,
+                    temporal_attention_every=self.config.memory_temporal_attention_every,
+                )
+            return self.paligemma_with_expert.embed_image(img)
 
-            def image_embed_func(img, img_mask):
-                if img.ndim == 5:
-                    return self.paligemma_with_expert.embed_image(
-                        img,
-                        frame_mask=img_mask,
-                        temporal_attention_every=self.config.memory_temporal_attention_every,
-                    )
-                return self.paligemma_with_expert.embed_image(img)
+        if any(img.ndim == 5 for img in images):
+            img_embs = [
+                self._apply_checkpoint(image_embed_func, img, img_mask)
+                for img, img_mask in zip(images, img_masks, strict=True)
+            ]
+        else:
+            img_embs = embed_images_batched(
+                lambda img: self._apply_checkpoint(image_embed_func, img, None), list(images)
+            )
 
-            img_emb = self._apply_checkpoint(image_embed_func, img, img_mask)
+        for img_emb, img_mask in zip(img_embs, img_masks, strict=True):
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
