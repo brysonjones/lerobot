@@ -381,9 +381,6 @@ def decode_video_frames_torchcodec(
     # Use cached decoder instead of creating new one each time
     decoder = decoder_cache.get_decoder(str(video_path))
 
-    loaded_ts = []
-    loaded_frames = []
-
     # get metadata for frame information
     metadata = decoder.metadata
     average_fps = metadata.average_fps
@@ -392,24 +389,30 @@ def decode_video_frames_torchcodec(
     # retrieve frames based on indices
     frames_batch = decoder.get_frames_at(indices=frame_indices)
 
-    for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
-        loaded_frames.append(frame)
-        loaded_ts.append(pts.item())
-        if log_loaded_timestamps:
-            logger.info(f"Frame loaded at timestamp={pts:.4f}")
-
+    # `data` is already the requested frames, stacked and in the requested order, in storage this
+    # call owns. Unbinding it into one tensor per frame and stacking them back would copy every
+    # decoded frame for nothing.
+    closest_frames = frames_batch.data
     # float64: hour-scale timestamps quantize past tolerance_s in float32.
     query_ts = torch.tensor(timestamps, dtype=torch.float64)
-    loaded_ts = torch.tensor(loaded_ts, dtype=torch.float64)
+    loaded_ts = frames_batch.pts_seconds.to(torch.float64)
 
-    # compute distances between each query timestamp and loaded timestamps
-    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
-    min_, argmin_ = dist.min(1)
+    if log_loaded_timestamps:
+        for pts in loaded_ts.tolist():
+            logger.info(f"Frame loaded at timestamp={pts:.4f}")
 
-    is_within_tol = min_ <= tolerance_s
+    if len(loaded_ts) != len(timestamps):
+        raise FrameTimestampError(
+            f"Decoder returned {len(loaded_ts)} frames for {len(timestamps)} queried timestamps."
+        )
+
+    # One frame per requested index, in order, so each is checked against the timestamp that asked
+    # for it rather than against whichever loaded frame happens to be nearest.
+    deviation = (loaded_ts - query_ts).abs()
+    is_within_tol = deviation <= tolerance_s
     if not is_within_tol.all():
         raise FrameTimestampError(
-            f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} >= {tolerance_s=})."
+            f"One or several query timestamps unexpectedly violate the tolerance ({deviation[~is_within_tol]} >= {tolerance_s=})."
             " It means that the closest frame that can be loaded from the video is too far away in time."
             " This might be due to synchronization issues with timestamps during data collection."
             " To be safe, we advise to ignore this item during training."
@@ -418,24 +421,14 @@ def decode_video_frames_torchcodec(
             f"\nvideo: {video_path}"
         )
 
-    # get closest frames to the query timestamps
-    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-    closest_ts = loaded_ts[argmin_]
-
     if log_loaded_timestamps:
-        logger.info(f"{closest_ts=}")
-
-    if not len(timestamps) == len(closest_frames):
-        raise FrameTimestampError(
-            f"Retrieved timestamps differ from queried {set(closest_frames) - set(timestamps)}"
-        )
+        logger.info(f"closest_ts={loaded_ts}")
 
     if return_uint8:
         return closest_frames
 
     # convert to float32 in [0,1] range
-    closest_frames = (closest_frames / 255.0).type(torch.float32)
-    return closest_frames
+    return (closest_frames / 255.0).type(torch.float32)
 
 
 def encode_video_frames(

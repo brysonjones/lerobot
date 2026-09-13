@@ -156,6 +156,7 @@ class DatasetReader(BaseDatasetReader):
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
+        self._decode_executor: ThreadPoolExecutor | None = None
         self._column_views: dict[str, datasets.Dataset] = {}
         self._column_views_source: datasets.Dataset | None = None
         self._column_views_transform: Callable | None = None
@@ -410,10 +411,22 @@ class DatasetReader(BaseDatasetReader):
         if len(items) <= 1:
             return {vid_key: _decode_single(vid_key, query_ts)[1] for vid_key, query_ts in items}
 
-        # Multi-camera: decode in parallel (video decoding releases the GIL)
-        with ThreadPoolExecutor(max_workers=len(items)) as pool:
-            futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
-            return dict(f.result() for f in futures)
+        # Multi-camera: decode in parallel (video decoding releases the GIL). The pool is built
+        # once and reused; constructing and tearing one down per sample costs more than it saves
+        # on a dataset with only a handful of cameras.
+        pool = self._decode_pool(len(items))
+        futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
+        return dict(f.result() for f in futures)
+
+    def _decode_pool(self, workers: int) -> ThreadPoolExecutor:
+        """Return this reader's decode thread pool, sized for the widest call seen so far."""
+        if self._decode_executor is None or self._decode_executor._max_workers < workers:
+            if self._decode_executor is not None:
+                self._decode_executor.shutdown(wait=False)
+            self._decode_executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="lerobot-decode"
+            )
+        return self._decode_executor
 
     def get_item(self, idx) -> dict:
         """Core __getitem__ logic. Loads hf_dataset on first access.
