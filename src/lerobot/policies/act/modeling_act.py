@@ -379,6 +379,46 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def _encode_images(self, images: list[Tensor]) -> tuple[Tensor, Tensor]:
+        """Turn the camera images into encoder tokens and their position embeddings.
+
+        The cameras share one backbone, so images of the same resolution go through it as a single
+        batch instead of one forward pass each. Tokens are ordered camera by camera, as if each had
+        been encoded on its own.
+
+        Args:
+            images (`list[torch.Tensor]`):
+                One `(B, C, H, W)` batch per camera. `H` and `W` may differ between cameras as long
+                as `H * W` does not.
+
+        Returns:
+            `tuple[torch.Tensor, torch.Tensor]`: The `(N * H' * W', B, D)` tokens and their
+            `(N * H' * W', 1, D)` position embeddings, where `H'` and `W'` are the feature-map size.
+        """
+        groups: list[list[Tensor]] = []
+        for image in images:
+            if groups and groups[-1][0].shape[-2:] == image.shape[-2:]:
+                groups[-1].append(image)
+            else:
+                groups.append([image])
+
+        tokens: list[Tensor] = []
+        pos_embeds: list[Tensor] = []
+        for group in groups:
+            num_cameras = len(group)
+            stacked = torch.cat(group, dim=0) if num_cameras > 1 else group[0]
+            feature_map = self.backbone(stacked)["feature_map"]
+            pos_embed = self.encoder_cam_feat_pos_embed(feature_map).to(dtype=feature_map.dtype)
+            feature_map = self.encoder_img_feat_input_proj(feature_map)
+            # (n b) c h w -> (n h w) b c keeps each camera's tokens contiguous and in camera order.
+            tokens.append(einops.rearrange(feature_map, "(n b) c h w -> (n h w) b c", n=num_cameras))
+            pos_embed = einops.rearrange(pos_embed, "1 c h w -> (h w) 1 c")
+            pos_embeds.append(pos_embed.repeat(num_cameras, 1, 1) if num_cameras > 1 else pos_embed)
+
+        if len(groups) == 1:
+            return tokens[0], pos_embeds[0]
+        return torch.cat(tokens, dim=0), torch.cat(pos_embeds, dim=0)
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
@@ -454,9 +494,10 @@ class ACT(nn.Module):
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
-            # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
+            latent_sample = torch.zeros(
+                [batch_size, self.config.latent_dim],
+                dtype=torch.float32,
+                device=batch[OBS_STATE].device,
             )
 
         # Prepare transformer encoder inputs.
@@ -469,27 +510,17 @@ class ACT(nn.Module):
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
-        if self.config.image_features:
-            # For a list of images, the H and W may vary but H*W is constant.
-            # NOTE: If modifying this section, verify on MPS devices that
-            # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
-
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
-
-        # Stack all tokens along the sequence dimension.
+        # Stack the 1D tokens along the sequence dimension. Their position embeddings carry a batch
+        # of 1 and broadcast, which is what lets the camera tokens below join them.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+
+        if self.config.image_features:
+            # NOTE: If modifying this section, verify on MPS devices that
+            # gradients remain stable (no explosions or NaNs).
+            cam_tokens, cam_pos_embed = self._encode_images(batch[OBS_IMAGES])
+            encoder_in_tokens = torch.cat([encoder_in_tokens, cam_tokens], axis=0)
+            encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, cam_pos_embed], axis=0)
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
@@ -703,6 +734,9 @@ class ACTSinusoidalPositionEmbedding2d(nn.Module):
         self._eps = 1e-6
         # Inverse "common ratio" for the geometric progression in sinusoid frequencies.
         self._temperature = 10000
+        # Built tables, keyed by feature-map size and device. Not registered as buffers: the sizes
+        # are discovered from the first forward, and a checkpoint should not carry them.
+        self._cache: dict[tuple[int, int, torch.device], Tensor] = {}
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -711,6 +745,17 @@ class ACTSinusoidalPositionEmbedding2d(nn.Module):
         Returns:
             A (1, C, H, W) batch of corresponding sinusoidal positional embeddings.
         """
+        # The table depends only on the feature-map size, which is fixed once the backbone is
+        # built, so it is built once per size instead of once per camera per step.
+        key = (x.shape[-2], x.shape[-1], x.device)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        pos_embed = self._make_pos_embed(x)
+        self._cache[key] = pos_embed
+        return pos_embed
+
+    def _make_pos_embed(self, x: Tensor) -> Tensor:
         not_mask = torch.ones_like(x[0, :1])  # (1, H, W)
         # Note: These are like range(1, H+1) and range(1, W+1) respectively, but in most implementations
         # they would be range(0, H) and range(0, W). Keeping it at as is to match the original code.
