@@ -54,6 +54,8 @@ class ACTConfig(PreTrainedConfig):
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        channels_last: Run the vision backbone in channels-last (NHWC) layout, which removes the
+            layout transposes cuDNN would otherwise do around every convolution under autocast.
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
             `None` means no pretrained weights.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
@@ -96,6 +98,12 @@ class ACTConfig(PreTrainedConfig):
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    # Hold the vision backbone's weights and its input in channels-last (NHWC) layout. Under
+    # autocast, cuDNN picks NHWC tensor-core kernels for these convolutions and transposes into and
+    # out of that layout on every call; keeping the data in it removes both transposes. Numerically
+    # this is a layout change, not a different computation, but it does change which kernels run,
+    # so results can differ in the last bits as any cuDNN algorithm choice does. Off by default.
+    channels_last: bool = False
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Transformer layers.

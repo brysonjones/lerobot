@@ -334,6 +334,10 @@ class ACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if config.channels_last:
+                # The weights carry the layout: a conv whose weight is channels-last produces a
+                # channels-last output, so one call here puts the whole backbone in NHWC.
+                self.backbone = self.backbone.to(memory_format=torch.channels_last)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -474,6 +478,10 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
+                if self.config.channels_last:
+                    # Without this the first convolution transposes the batch itself, which is the
+                    # cost the option exists to remove.
+                    img = img.contiguous(memory_format=torch.channels_last)
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)

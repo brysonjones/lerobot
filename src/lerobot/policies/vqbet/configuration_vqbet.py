@@ -95,6 +95,12 @@ class VQBeTConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    # Hold the vision backbone's weights and its input in channels-last (NHWC) layout. Under
+    # autocast, cuDNN picks NHWC tensor-core kernels for these convolutions and transposes into and
+    # out of that layout on every call; keeping the data in it removes both transposes. Numerically
+    # this is a layout change, not a different computation, but it does change which kernels run,
+    # so results can differ in the last bits as any cuDNN algorithm choice does. Off by default.
+    channels_last: bool = False
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"

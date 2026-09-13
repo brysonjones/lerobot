@@ -504,6 +504,7 @@ class DiffusionRgbEncoder(nn.Module):
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+        self._channels_last = config.channels_last
         if config.use_group_norm:
             if config.pretrained_backbone_weights:
                 raise ValueError(
@@ -514,6 +515,12 @@ class DiffusionRgbEncoder(nn.Module):
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
+
+        if self._channels_last:
+            # After the BatchNorm replacement, so the whole backbone as it will run carries the
+            # layout. A conv whose weight is channels-last produces a channels-last output, so one
+            # call here is enough.
+            self.backbone = self.backbone.to(memory_format=torch.channels_last)
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
@@ -553,6 +560,10 @@ class DiffusionRgbEncoder(nn.Module):
                 # Always use center crop for eval.
                 x = self.center_crop(x)
         # Extract backbone feature.
+        if self._channels_last:
+            # Without this the first convolution transposes the batch itself, which is the cost
+            # the option exists to remove.
+            x = x.contiguous(memory_format=torch.channels_last)
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))

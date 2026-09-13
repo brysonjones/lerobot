@@ -120,6 +120,12 @@ class DiffusionConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    # Hold the vision backbone's weights and its input in channels-last (NHWC) layout. Under
+    # autocast, cuDNN picks NHWC tensor-core kernels for these convolutions and transposes into and
+    # out of that layout on every call; keeping the data in it removes both transposes. Numerically
+    # this is a layout change, not a different computation, but it does change which kernels run,
+    # so results can differ in the last bits as any cuDNN algorithm choice does. Off by default.
+    channels_last: bool = False
     resize_shape: tuple[int, int] | None = None
     crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = None
