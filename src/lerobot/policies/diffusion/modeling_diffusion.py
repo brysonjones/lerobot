@@ -209,10 +209,15 @@ class DiffusionModel(nn.Module):
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
-        if config.compile_model:
-            # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
-            # common in diffusion inference.
-            self.unet = torch.compile(self.unet, mode=config.compile_mode)
+        # Compile the bound forward rather than the module. `torch.compile(module)` returns a
+        # wrapper whose parameters sit under `_orig_mod`, which renames every key of the enclosing
+        # policy's state_dict: a checkpoint written with compile_model on could not be loaded with
+        # it off, and vice versa. Wrapping the forward leaves the module tree alone.
+        self._unet_forward = (
+            torch.compile(self.unet.forward, mode=config.compile_mode)
+            if config.compile_model
+            else self.unet.forward
+        )
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -257,7 +262,7 @@ class DiffusionModel(nn.Module):
 
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
-            model_output = self.unet(
+            model_output = self._unet_forward(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                 global_cond=global_cond,
@@ -372,7 +377,7 @@ class DiffusionModel(nn.Module):
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        pred = self._unet_forward(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
