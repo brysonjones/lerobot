@@ -19,6 +19,9 @@ from lerobot.optim.optimizers import (
     AdamWConfig,
     MultiAdamConfig,
     SGDConfig,
+    _flatten_params,
+    _fused_kwargs,
+    _supports_fused,
     load_optimizer_state,
     save_optimizer_state,
 )
@@ -240,3 +243,74 @@ def test_save_and_load_empty_multi_optimizer_state(base_params_dict, tmp_path):
         torch.testing.assert_close(
             optimizer.state_dict()["param_groups"], loaded_optimizers[name].state_dict()["param_groups"]
         )
+
+
+class TestFusedSelection:
+    """`fused=None` means "use the fused kernel where it works", so the predicate has to be exact."""
+
+    @pytest.mark.parametrize("config_cls", [AdamConfig, AdamWConfig, SGDConfig])
+    def test_cpu_parameters_do_not_ask_for_the_fused_path(self, config_cls, model_params):
+        optimizer = config_cls().build(model_params)
+        assert optimizer.defaults.get("fused") in (None, False)
+
+    @pytest.mark.parametrize("config_cls", [AdamConfig, AdamWConfig, SGDConfig])
+    def test_explicit_setting_overrides_the_predicate(self, config_cls):
+        """Whether a device can fuse is torch's business once the caller has asked for it."""
+        assert config_cls(fused=True).build(torch.nn.Linear(4, 4).parameters()).defaults["fused"] is True
+        assert config_cls(fused=False).build(torch.nn.Linear(4, 4).parameters()).defaults.get("fused") in (
+            None,
+            False,
+        )
+
+    def test_fused_kwargs_translation(self):
+        assert _fused_kwargs(True, []) == {"fused": True}
+        assert _fused_kwargs(False, []) == {}
+        assert _fused_kwargs(None, []) == {}
+
+    def test_predicate_rejects_cpu_and_non_float(self):
+        assert not _supports_fused([])
+        assert not _supports_fused([torch.zeros(2)])
+        assert not _supports_fused([torch.zeros(2, dtype=torch.int64)])
+
+    def test_predicate_needs_one_accelerator(self):
+        class FakeParam:
+            def __init__(self, device_type):
+                self.device = torch.device(device_type)
+
+            def is_floating_point(self):
+                return True
+
+        assert _supports_fused([FakeParam("cuda"), FakeParam("cuda")])
+        assert _supports_fused([FakeParam("xpu")])
+        assert not _supports_fused([FakeParam("cuda"), FakeParam("cpu")])
+        assert not _supports_fused([FakeParam("meta")])
+
+    def test_generator_parameters_survive_inspection(self):
+        """A policy returning model.parameters() must not have it consumed by the device check."""
+        model = torch.nn.Linear(4, 4)
+        optimizer = AdamConfig().build(model.parameters())
+        assert len(optimizer.param_groups[0]["params"]) == len(list(model.parameters()))
+
+    def test_param_groups_are_flattened_for_inspection(self):
+        model = torch.nn.Linear(4, 4)
+        groups = [{"params": [model.weight], "lr": 1e-4}, {"params": [model.bias]}]
+        materialized, tensors = _flatten_params(groups)
+        assert len(materialized) == 2
+        assert tensors == [model.weight, model.bias]
+
+    def test_named_parameter_dicts_are_left_alone(self):
+        """XVLA-style dicts are the optimizer's business, not the fused predicate's."""
+        model = torch.nn.Linear(4, 4)
+        named = dict(model.named_parameters())
+        materialized, tensors = _flatten_params(named)
+        assert materialized is named and tensors == []
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="checks the accelerator path")
+    @pytest.mark.parametrize("config_cls", [AdamConfig, AdamWConfig])
+    def test_cuda_parameters_take_the_fused_path_and_step(self, config_cls):
+        model = torch.nn.Linear(4, 4).cuda()
+        optimizer = config_cls().build(model.parameters())
+        assert optimizer.defaults["fused"] is True
+        model(torch.randn(2, 4, device="cuda")).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()

@@ -42,6 +42,68 @@ OptimizerParams = (
 )
 
 
+def _flatten_params(params: OptimizerParams) -> tuple[OptimizerParams, list[torch.Tensor]]:
+    """Materialize `params` and return it alongside every tensor it contains.
+
+    A policy may hand back a generator (`model.parameters()`), which any inspection would exhaust,
+    so an iterable is turned into a list and that list is what the optimizer receives.
+
+    Args:
+        params (`OptimizerParams`):
+            Parameters as accepted by the `build` methods.
+
+    Returns:
+        `tuple[OptimizerParams, list[torch.Tensor]]`: The parameters to hand to the optimizer, and
+        the flat list of tensors found in them (empty when the layout is not recognized).
+    """
+    if isinstance(params, dict):
+        return params, []
+    materialized = list(params)
+    tensors: list[torch.Tensor] = []
+    for entry in materialized:
+        if isinstance(entry, torch.Tensor):
+            tensors.append(entry)
+        elif isinstance(entry, dict):
+            group = entry.get("params", [])
+            tensors.extend(p for p in ([group] if isinstance(group, torch.Tensor) else group))
+        else:  # an unrecognized layout: leave the decision to the caller's explicit setting
+            return materialized, []
+    return materialized, tensors
+
+
+def _supports_fused(tensors: list[torch.Tensor]) -> bool:
+    """Whether a fused optimizer can step every one of `tensors`.
+
+    PyTorch's fused path needs floating-point parameters that all live on one device. Only
+    accelerators are auto-selected: the fused CPU kernels exist but are not reliably faster than the
+    default path, so a CPU run keeps the behaviour it had. Sharded runs are excluded too, because
+    their parameters are `DTensor`s whose fused support depends on the torch version, and a wrong
+    guess here would fail a long run at its first step. Set `fused` explicitly to override.
+    """
+    if not tensors:
+        return False
+    dtensor = getattr(getattr(torch.distributed, "tensor", None), "DTensor", None)
+    devices = set()
+    for tensor in tensors:
+        if dtensor is not None and isinstance(tensor, dtensor):
+            return False
+        if not tensor.is_floating_point():
+            return False
+        devices.add(tensor.device.type)
+    return devices in ({"cuda"}, {"xpu"})
+
+
+def _fused_kwargs(fused: bool | None, tensors: list[torch.Tensor]) -> dict[str, Any]:
+    """Translate the `fused` setting into optimizer keyword arguments.
+
+    `None` means "use the fused path when it is available", which is why it is the default: the
+    fused kernel replaces one launch per parameter tensor with a single launch for the whole step.
+    """
+    if fused is None:
+        fused = _supports_fused(tensors)
+    return {"fused": True} if fused else {}
+
+
 @dataclass
 class OptimizerConfig(draccus.ChoiceRegistry, abc.ABC):
     lr: float
@@ -94,11 +156,15 @@ class AdamConfig(OptimizerConfig):
     eps: float = 1e-8
     weight_decay: float = 0.0
     grad_clip_norm: float = 10.0
+    # None uses the fused implementation wherever it is available; see `_fused_kwargs`.
+    fused: bool | None = None
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
-        return torch.optim.Adam(params, **kwargs)
+        fused = kwargs.pop("fused")
+        params, tensors = _flatten_params(params)
+        return torch.optim.Adam(params, **kwargs, **_fused_kwargs(fused, tensors))
 
 
 @OptimizerConfig.register_subclass("adamw")
@@ -109,11 +175,15 @@ class AdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     weight_decay: float = 1e-2
     grad_clip_norm: float = 10.0
+    # None uses the fused implementation wherever it is available; see `_fused_kwargs`.
+    fused: bool | None = None
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
-        return torch.optim.AdamW(params, **kwargs)
+        fused = kwargs.pop("fused")
+        params, tensors = _flatten_params(params)
+        return torch.optim.AdamW(params, **kwargs, **_fused_kwargs(fused, tensors))
 
 
 @OptimizerConfig.register_subclass("sgd")
@@ -125,11 +195,15 @@ class SGDConfig(OptimizerConfig):
     nesterov: bool = False
     weight_decay: float = 0.0
     grad_clip_norm: float = 10.0
+    # None uses the fused implementation wherever it is available; see `_fused_kwargs`.
+    fused: bool | None = None
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
-        return torch.optim.SGD(params, **kwargs)
+        fused = kwargs.pop("fused")
+        params, tensors = _flatten_params(params)
+        return torch.optim.SGD(params, **kwargs, **_fused_kwargs(fused, tensors))
 
 
 @OptimizerConfig.register_subclass("xvla-adamw")
