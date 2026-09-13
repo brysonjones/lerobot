@@ -298,6 +298,7 @@ def make_dataloaders(
             shuffle=True,
             seed=cfg.seed if cfg.seed is not None else 0,
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            continuous=cfg.dataset.continuous_sampling,
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (dp_world_size, batch_size) that produced `step`,
@@ -321,7 +322,13 @@ def make_dataloaders(
                     f"with batch_size={saved_batch_size}. The data order resumes at the right "
                     "epoch/offset, but per-rank sample-exactness requires the same batch size."
                 )
-            sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_dp_world)
+            sampler_state = compute_sampler_state(
+                step,
+                len(sampler),
+                ckpt_batch_size,
+                ckpt_dp_world,
+                continuous=cfg.dataset.continuous_sampling,
+            )
             sampler.load_state_dict(sampler_state)
             if is_main_process():
                 logging.info(

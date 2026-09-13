@@ -13,8 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools
 import logging
 
+import numpy as np
 import pytest
 import torch
 
@@ -232,3 +234,93 @@ def test_compute_sampler_state():
         "epoch": 1,
         "start_index": 100,
     }
+
+
+class TestContinuousSampling:
+    """A continuous sampler never ends, so the DataLoader's prefetch queue survives epoch boundaries."""
+
+    STARTS = [0, 10, 25]
+    ENDS = [10, 25, 40]
+
+    def _sampler(self, continuous, **kwargs):
+        return EpisodeAwareSampler(
+            self.STARTS, self.ENDS, shuffle=True, seed=3, continuous=continuous, **kwargs
+        )
+
+    def test_first_epoch_is_the_same_order_as_a_finite_sampler(self):
+        finite = list(self._sampler(continuous=False))
+        continuous = list(itertools.islice(iter(self._sampler(continuous=True)), len(finite)))
+        assert continuous == finite
+
+    def test_iteration_does_not_end(self):
+        sampler = self._sampler(continuous=True)
+        assert len(list(itertools.islice(iter(sampler), 3 * len(sampler) + 7))) == 3 * len(sampler) + 7
+
+    def test_each_epoch_is_a_full_permutation(self):
+        sampler = self._sampler(continuous=True)
+        epoch_length = len(sampler)
+        drawn = list(itertools.islice(iter(sampler), 3 * epoch_length))
+        expected = sorted(self._sampler(continuous=False))
+        for start in range(0, 3 * epoch_length, epoch_length):
+            assert sorted(drawn[start : start + epoch_length]) == expected
+
+    def test_successive_epochs_differ(self):
+        sampler = self._sampler(continuous=True)
+        epoch_length = len(sampler)
+        drawn = list(itertools.islice(iter(sampler), 2 * epoch_length))
+        assert drawn[:epoch_length] != drawn[epoch_length:]
+
+    def test_resumes_at_the_recorded_position(self):
+        finite = self._sampler(continuous=False)
+        finite.load_state_dict({"epoch": 1, "start_index": 0})
+        continuous = self._sampler(continuous=True)
+        continuous.load_state_dict({"epoch": 1, "start_index": 0})
+        assert list(itertools.islice(iter(continuous), len(finite))) == list(finite)
+
+    def test_resume_offset_inside_an_epoch(self):
+        whole = list(itertools.islice(iter(self._sampler(continuous=True)), len(self.ENDS) * 40))
+        offset = 7
+        resumed = self._sampler(continuous=True)
+        resumed.load_state_dict({"epoch": 0, "start_index": offset})
+        assert list(itertools.islice(iter(resumed), 10)) == whole[offset : offset + 10]
+
+    def test_epoch_state_keeps_advancing(self):
+        sampler = self._sampler(continuous=True)
+        epoch_length = len(sampler)
+        iterator = iter(sampler)
+        list(itertools.islice(iterator, 2 * epoch_length + 1))
+        assert sampler.state_dict()["epoch"] >= 2
+
+    def test_subset_mapping_is_applied(self):
+        mapping = {index: position for position, index in enumerate(range(10, 25))}
+        sampler = EpisodeAwareSampler(
+            [10], [25], shuffle=True, seed=1, absolute_to_relative_idx=mapping, continuous=True
+        )
+        assert sorted(itertools.islice(iter(sampler), 15)) == list(range(15))
+
+
+class TestVectorizedIndexTranslation:
+    def test_matches_the_per_position_form(self):
+        sampler = EpisodeAwareSampler([0, 10, 25], [10, 25, 40], shuffle=False)
+        positions = np.arange(len(sampler))
+        expected = [sampler._frame_index(int(position)) for position in positions]
+        assert sampler._frame_indices(positions).tolist() == expected
+
+    def test_matches_the_per_position_form_with_a_subset_mapping(self):
+        mapping = {index: position for position, index in enumerate(range(10, 25))}
+        sampler = EpisodeAwareSampler([10], [25], shuffle=False, absolute_to_relative_idx=mapping)
+        positions = np.arange(len(sampler))
+        expected = [sampler._frame_index(int(position)) for position in positions]
+        assert sampler._frame_indices(positions).tolist() == expected
+
+
+class TestContinuousResumeMath:
+    def test_position_is_exact(self):
+        assert compute_sampler_state(3, 40, 8, 1, continuous=True) == {"epoch": 0, "start_index": 24}
+        assert compute_sampler_state(6, 40, 8, 1, continuous=True) == {"epoch": 1, "start_index": 8}
+
+    def test_multi_process_positions_scale(self):
+        assert compute_sampler_state(2, 40, 8, 2, continuous=True) == {"epoch": 0, "start_index": 32}
+
+    def test_finite_mode_is_unchanged(self):
+        assert compute_sampler_state(3, 40, 8, 1) == compute_sampler_state(3, 40, 8, 1, continuous=False)

@@ -23,6 +23,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _as_lookup_arrays(mapping: dict[int, int] | None) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Turn an index mapping into sorted key/value arrays for vectorized lookup.
+
+    Args:
+        mapping (`dict[int, int] | None`):
+            Dataset frame index to row position, or `None` when the dataset holds every episode.
+
+    Returns:
+        `tuple[np.ndarray | None, np.ndarray | None]`: The sorted keys and their values, or
+        `(None, None)` when there is nothing to map.
+    """
+    if not mapping:
+        return None, None
+    keys = np.fromiter(mapping.keys(), dtype=np.int64, count=len(mapping))
+    values = np.fromiter(mapping.values(), dtype=np.int64, count=len(mapping))
+    order = np.argsort(keys)
+    return keys[order], values[order]
+
+
 class EpisodeAwareSampler:
     """Sampler over episode frames that stores only per-episode boundaries.
 
@@ -54,6 +73,7 @@ class EpisodeAwareSampler:
         shuffle: bool = False,
         seed: int = 0,
         absolute_to_relative_idx: dict[int, int] | None = None,
+        continuous: bool = False,
     ):
         """
         Args:
@@ -64,6 +84,10 @@ class EpisodeAwareSampler:
             drop_n_last_frames: Frames to drop from the end of each episode.
             shuffle: Whether to shuffle the indices.
             seed: Seed the permutation is derived from (together with the epoch).
+            absolute_to_relative_idx: Mapping from dataset frame index to row position, when the
+                dataset holds a subset of the episodes.
+            continuous: Yield epoch after epoch from a single iterator instead of ending at each
+                epoch boundary. Keeps the DataLoader's prefetch queue full across the boundary.
         """
         if drop_n_first_frames < 0:
             raise ValueError(f"drop_n_first_frames must be >= 0, got {drop_n_first_frames}")
@@ -106,9 +130,11 @@ class EpisodeAwareSampler:
         self._num_frames = int(self._cum_lengths[-1])
         self.shuffle = shuffle
         self.seed = seed
+        self.continuous = continuous
         self._epoch = 0
         self._start_index = 0
         self._absolute_to_relative = absolute_to_relative_idx
+        self._relative_keys, self._relative_values = _as_lookup_arrays(absolute_to_relative_idx)
 
     @property
     def indices(self) -> list[int]:
@@ -139,27 +165,61 @@ class EpisodeAwareSampler:
             return self._absolute_to_relative[absolute_idx]
         return absolute_idx
 
+    def _frame_indices(self, positions: np.ndarray) -> np.ndarray:
+        """Translate sampler positions into dataset indices, all of them at once.
+
+        The per-position form costs a `searchsorted` and three Python casts each, in the main
+        process, for every index the loop consumes. One vectorized call per epoch does the same work.
+        """
+        episodes = np.searchsorted(self._cum_lengths, positions, side="right")
+        offsets = np.where(episodes > 0, self._cum_lengths[np.maximum(episodes - 1, 0)], 0)
+        absolute = self._starts[episodes] + (positions - offsets)
+        if self._relative_keys is None:
+            return absolute
+        return self._relative_values[np.searchsorted(self._relative_keys, absolute)]
+
     def __iter__(self) -> Iterator[int]:
         # Advance epoch state eagerly, not on first consumption of the generator.
         epoch, start = self._epoch, self._start_index
         self._epoch += 1
         self._start_index = 0
-        return self._iter_epoch(epoch, start)
+        if not self.continuous:
+            return self._iter_epoch(epoch, start)
+        return self._iter_continuous(epoch, start)
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
-        if self.shuffle:
-            order = torch.randperm(self._num_frames, generator=self._epoch_generator(epoch))
-            for k in range(start, self._num_frames):
-                yield self._frame_index(int(order[k]))
-        else:
-            for k in range(start, self._num_frames):
-                yield self._frame_index(k)
+        yield from (int(index) for index in self._epoch_indices(epoch, start))
+
+    def _iter_continuous(self, epoch: int, start: int) -> Iterator[int]:
+        """Yield one epoch after another without ever ending.
+
+        A finite sampler ends the DataLoader's iterator once per epoch. Restarting it drains the
+        workers' prefetch queue, and the accelerator waits for a full fetch round before the next
+        step can run. Iterating without a break keeps the queue full across the boundary; the frames
+        of an epoch's tail simply share a batch with the next epoch's head, and no frame is skipped
+        or repeated within an epoch.
+        """
+        while True:
+            yield from self._iter_epoch(epoch, start)
+            epoch += 1
+            start = 0
+            self._epoch = epoch + 1
+
+    def _epoch_indices(self, epoch: int, start: int) -> np.ndarray:
+        positions = (
+            torch.randperm(self._num_frames, generator=self._epoch_generator(epoch)).numpy()
+            if self.shuffle
+            else np.arange(self._num_frames)
+        )
+        return self._frame_indices(positions[start:])
 
     def __len__(self) -> int:
         return self._num_frames
 
 
-def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
+def compute_sampler_state(
+    step: int, num_frames: int, batch_size: int, num_processes: int, continuous: bool = False
+) -> dict:
     """Map an optimization step to an `EpisodeAwareSampler` state for sample-exact resume.
 
     Under accelerate's batch sharding, one step consumes `batch_size * num_processes` sampler
@@ -173,8 +233,14 @@ def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_proce
           caller passes the checkpoint's `num_processes` and `batch_size` and warns on a mismatch.
         - accelerate uses `even_batches=True` (its default). The `ceil(... / num_processes)` term
           mirrors that padding; with `even_batches=False` the per-epoch batch count differs and
-          the boundary is off.
+          the boundary is off. A `continuous` sampler has neither a short batch nor padding, so its
+          position is exact.
     """
+    if continuous:
+        # Nothing is padded and no batch is short, so the position is simply what has been consumed.
+        position = step * batch_size * num_processes
+        epoch, start_index = divmod(position, num_frames)
+        return {"epoch": epoch, "start_index": start_index}
     batches_per_epoch = math.ceil(math.ceil(num_frames / batch_size) / num_processes)
     epoch, batches_into_epoch = divmod(step, batches_per_epoch)
     start_index = min(batches_into_epoch * batch_size * num_processes, num_frames)
