@@ -394,8 +394,10 @@ class XVLAPolicy(PreTrainedPolicy):
         losses = self.model(action=targets, **inputs)
         total_loss = sum(losses.values())
 
-        log_dict = {k: v.detach().item() for k, v in losses.items()}
-        log_dict["loss"] = total_loss.detach().item()
+        # Detached tensors, not floats: the metrics tracker accumulates them on the accelerator,
+        # so the forward pass does not end by blocking the host before the backward is queued.
+        log_dict = {k: v.detach() for k, v in losses.items()}
+        log_dict["loss"] = total_loss.detach()
         return total_loss, log_dict
 
     def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:

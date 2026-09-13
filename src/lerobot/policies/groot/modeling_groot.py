@@ -466,7 +466,9 @@ class GrootPolicy(PreTrainedPolicy):
                 "'action' and 'action_mask'; check the preprocessor output."
             )
 
-        loss_dict = {"loss": loss.item()}
+        # Detached tensors, not floats: the metrics tracker accumulates them on the accelerator,
+        # so the forward pass does not end by blocking the host before the backward is queued.
+        loss_dict = {"loss": loss.detach()}
 
         return loss, loss_dict
 

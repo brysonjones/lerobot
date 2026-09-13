@@ -478,10 +478,12 @@ class Evo1Policy(PreTrainedPolicy):
         # and the whole difference is multiplied by `flat_action_mask`, so padded dims contribute nothing.
         target_velocity = (actions_gt.float() - noise).view(actions_gt.shape[0], -1) * flat_action_mask
         loss = self._compute_masked_loss(pred_velocity, target_velocity, action_mask, reduction)
-        loss_mean = loss.mean().item() if loss.ndim > 0 else loss.item()
+        # Detached tensors, not floats: the metrics tracker accumulates them on the accelerator,
+        # so the forward pass does not end by blocking the host before the backward is queued.
+        loss_mean = loss.detach().mean() if loss.ndim > 0 else loss.detach()
         return loss, {
             "loss": loss_mean,
-            "active_action_dims": float(action_mask.sum(dim=(1, 2)).float().mean().item()),
+            "active_action_dims": action_mask.sum(dim=(1, 2)).float().mean(),
         }
 
     @torch.no_grad()

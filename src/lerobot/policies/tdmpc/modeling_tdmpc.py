@@ -359,7 +359,9 @@ class TDMPCPolicy(PreTrainedPolicy):
         # Compute Q and V value predictions based on the latent rollout.
         q_preds_ensemble = self.model.Qs(z_preds[:-1], action)  # (ensemble, horizon, batch)
         v_preds = self.model.V(z_preds[:-1])
-        info.update({"Q": q_preds_ensemble.mean().item(), "V": v_preds.mean().item()})
+        # Detached tensors, not floats: reading them here would drain the accelerator in the middle
+        # of the forward pass, before the loss is even built.
+        info.update({"Q": q_preds_ensemble.mean().detach(), "V": v_preds.mean().detach()})
 
         # Compute various targets with stopgrad.
         with torch.no_grad():
@@ -493,12 +495,12 @@ class TDMPCPolicy(PreTrainedPolicy):
 
         info.update(
             {
-                "consistency_loss": consistency_loss.item(),
-                "reward_loss": reward_loss.item(),
-                "Q_value_loss": q_value_loss.item(),
-                "V_value_loss": v_value_loss.item(),
-                "pi_loss": pi_loss.item(),
-                "sum_loss": loss.item() * self.config.horizon,
+                "consistency_loss": consistency_loss.detach(),
+                "reward_loss": reward_loss.detach(),
+                "Q_value_loss": q_value_loss.detach(),
+                "V_value_loss": v_value_loss.detach(),
+                "pi_loss": pi_loss.detach(),
+                "sum_loss": loss.detach() * self.config.horizon,
             }
         )
 

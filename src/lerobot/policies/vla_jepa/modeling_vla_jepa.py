@@ -493,8 +493,10 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         ref = next(iter(native_output.values()))
         zero = torch.zeros_like(ref)
         total_loss = native_output.get("action_loss", zero) + native_output.get("wm_loss", zero)
-        logs = {k: v.detach().mean().item() for k, v in native_output.items()}
-        logs["loss"] = total_loss.detach().mean().item()
+        # Detached tensors, not floats: the metrics tracker accumulates them on the accelerator,
+        # so the forward pass does not end by blocking the host before the backward is queued.
+        logs = {k: v.detach().mean() for k, v in native_output.items()}
+        logs["loss"] = total_loss.detach().mean()
         return total_loss, logs
 
     def get_optim_params(self) -> dict:

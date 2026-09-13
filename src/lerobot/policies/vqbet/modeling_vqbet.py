@@ -142,7 +142,7 @@ class VQBeTPolicy(PreTrainedPolicy):
 
         self._queues = populate_queues(self._queues, batch)
 
-        if not self.vqbet.action_head.vqvae_model.discretized.item():
+        if not self.vqbet.action_head.vqvae_model.is_discretized:
             warnings.warn(
                 "To evaluate in the environment, your VQ-BeT model should contain a pretrained Residual VQ.",
                 stacklevel=1,
@@ -161,7 +161,7 @@ class VQBeTPolicy(PreTrainedPolicy):
         batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
         batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # VQ-BeT discretizes action using VQ-VAE before training BeT (please refer to section 3.2 in the VQ-BeT paper https://huggingface.co/papers/2403.03181)
-        if not self.vqbet.action_head.vqvae_model.discretized.item():
+        if not self.vqbet.action_head.vqvae_model.is_discretized:
             # loss: total loss of training RVQ
             # n_different_codes: how many of the total possible VQ codes are being used in single batch (how many of them have at least one encoder embedding as a nearest neighbor). This can be at most `vqvae_n_embed * number of layers of RVQ (=2)`.
             # n_different_combinations: how many different code combinations are being used out of all possible combinations in single batch. This can be at most `vqvae_n_embed ^ number of layers of RVQ (=2)` (hint consider the RVQ as a decision tree).
@@ -460,15 +460,16 @@ class VQBeTHead(nn.Module):
         # `actions` is a tensor of shape (new_batch, action_chunk_size, action_dim) where new_batch is the number of possible chunks created from the original sequences using the sliding window.
 
         loss, metric = self.vqvae_model.vqvae_forward(actions)
+        # Counted on the device: `len(torch.unique(...))` reads the result back once per layer.
         n_different_codes = sum(
-            [len(torch.unique(metric[2][:, i])) for i in range(self.vqvae_model.vqvae_num_layers)]
+            torch.unique(metric[2][:, i]).numel() for i in range(self.vqvae_model.vqvae_num_layers)
         )
-        n_different_combinations = len(torch.unique(metric[2], dim=0))
-        recon_l1_error = metric[0].detach().cpu().item()
+        n_different_combinations = torch.unique(metric[2], dim=0).shape[0]
+        recon_l1_error = metric[0].detach()
         self.vqvae_model.optimized_steps += 1
         # if we updated RVQ more than `n_vqvae_training_steps` steps, we freeze the RVQ part.
         if self.vqvae_model.optimized_steps >= n_vqvae_training_steps:
-            self.vqvae_model.discretized.fill_(True)
+            self.vqvae_model.set_discretized(True)
             self.vqvae_model.vq_layer.freeze_codebook.fill_(True)
             print("Finished discretizing action data!")
             self.vqvae_model.eval()
@@ -632,16 +633,18 @@ class VQBeTHead(nn.Module):
 
         loss = cbet_loss + self.config.offset_loss_weight * offset_loss
 
+        # Detached tensors, not floats: eight copies to the host would drain the accelerator at the
+        # end of every forward pass, before the backward is queued.
         loss_dict = {
             "loss": loss,
-            "classification_loss": cbet_loss.detach().cpu().item(),
-            "offset_loss": offset_loss.detach().cpu().item(),
-            "equal_primary_code_rate": equal_primary_code_rate.detach().cpu().item(),
-            "equal_secondary_code_rate": equal_secondary_code_rate.detach().cpu().item(),
-            "vq_action_error": vq_action_error.detach().cpu().item(),
-            "offset_action_error": offset_action_error.detach().cpu().item(),
-            "action_error_max": action_error_max.detach().cpu().item(),
-            "action_mse_error": action_mse_error.detach().cpu().item(),
+            "classification_loss": cbet_loss.detach(),
+            "offset_loss": offset_loss.detach(),
+            "equal_primary_code_rate": equal_primary_code_rate.detach(),
+            "equal_secondary_code_rate": equal_secondary_code_rate.detach(),
+            "vq_action_error": vq_action_error.detach(),
+            "offset_action_error": offset_action_error.detach(),
+            "action_error_max": action_error_max.detach(),
+            "action_mse_error": action_mse_error.detach(),
         }
         return loss_dict
 
@@ -774,6 +777,10 @@ class VqVae(nn.Module):
         self.config = config
         # 'discretized' indicates whether the Residual VQ part is trained or not. (After finishing the training, we set discretized=True)
         self.register_buffer("discretized", torch.tensor(False))
+        # A Python mirror of the buffer above. `forward` branches on it once per step, and reading
+        # the buffer itself would synchronize the host with the accelerator to do so.
+        self._discretized = False
+        self.register_load_state_dict_post_hook(type(self)._refresh_discretized)
         self.optimized_steps = 0
         # we use the fixed number of layers for Residual VQ across all environments.
         self.vqvae_num_layers = 2
@@ -800,6 +807,20 @@ class VqVae(nn.Module):
                 self.config.action_feature.shape[0] * self.config.action_chunk_size,
             ],
         )
+
+    @property
+    def is_discretized(self) -> bool:
+        """Whether the residual VQ has finished training, without reading the device buffer."""
+        return self._discretized
+
+    def set_discretized(self, value: bool) -> None:
+        """Mark the residual VQ as trained, keeping the checkpointed buffer and the mirror in step."""
+        self._discretized = bool(value)
+        self.discretized.fill_(self._discretized)
+
+    def _refresh_discretized(self, incompatible_keys) -> None:
+        """Restore the mirror after `load_state_dict` has written the buffer."""
+        self._discretized = bool(self.discretized.item())
 
     def get_embeddings_from_code(self, encoding_indices):
         # This function gets code indices as inputs, and outputs embedding vectors corresponding to the code indices.

@@ -1397,11 +1397,13 @@ class PI05Policy(PreTrainedPolicy):
 
         if reduction == "none":
             per_sample_loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="none")
-            loss_dict["loss"] = per_sample_loss.mean().item()
+            # Detached tensors, not floats: the metrics tracker accumulates them on the accelerator,
+            # so the forward pass does not end by blocking the host before the backward is queued.
+            loss_dict["loss"] = per_sample_loss.detach().mean()
             return per_sample_loss, loss_dict
 
         loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="mean")
-        loss_dict["loss"] = loss.item()
+        loss_dict["loss"] = loss.detach()
         return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:

@@ -1280,7 +1280,7 @@ class PI0FastPolicy(PreTrainedPolicy):
 
         loss = loss_dict["loss"]
         detailed_loss_dict = {
-            "loss": loss.item(),
-            "ce_loss": loss_dict["ce_loss"].item(),
+            "loss": loss.detach(),
+            "ce_loss": loss_dict["ce_loss"].detach(),
         }
         return loss, detailed_loss_dict
