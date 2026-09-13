@@ -18,6 +18,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import datasets
@@ -140,8 +141,9 @@ class DatasetReader(BaseDatasetReader):
                 relative timestamp offsets for temporal context windows.
             image_transforms: Optional torchvision v2 transform applied to
                 visual features.
-            return_uint8: If True, return RGB video frames as raw uint8 tensors
-                instead of normalized float32.
+            return_uint8: If True, return RGB frames as raw uint8 tensors instead of
+                normalized float32, whether they come from a video or from images
+                embedded in the parquet.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
         """
@@ -227,7 +229,8 @@ class DatasetReader(BaseDatasetReader):
         features = get_hf_features_from_features(self._meta.features)
         self._validate_language_columns_declared(features)
         hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
-        hf_dataset.set_transform(hf_transform_to_torch)
+        # Images embedded in the parquet obey the same uint8 contract as frames decoded from video.
+        hf_dataset.set_transform(partial(hf_transform_to_torch, return_uint8=self._return_uint8))
         return hf_dataset
 
     def _validate_language_columns_declared(self, features: datasets.Features) -> None:
@@ -447,7 +450,14 @@ class DatasetReader(BaseDatasetReader):
             for cam in self._meta.camera_keys:
                 if cam in self._meta.depth_keys:
                     continue
-                item[cam] = self._image_transforms(item[cam])
+                frames = item[cam]
+                # Several of the transforms act on floating-point input only, and embedded images
+                # used to arrive as float. Convert them back for the transform so that turning on
+                # uint8 transport does not quietly turn those transforms into no-ops. Frames
+                # decoded from video already reach this loop as uint8 and are left as they are.
+                if frames.dtype == torch.uint8 and cam not in self._meta.video_keys:
+                    frames = frames.to(dtype=torch.float32) / 255.0
+                item[cam] = self._image_transforms(frames)
 
         # Convert depth features to the output unit.
         for key, stored_unit in self._image_depth_units.items():

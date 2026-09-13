@@ -252,29 +252,50 @@ def load_image_as_numpy(
 UINT16_PIL_MODES = {"I;16", "I;16B", "I;16L"}
 
 
-def pil_to_chw_tensor(img: PILImage.Image) -> torch.Tensor:
+def pil_to_chw_tensor(img: PILImage.Image, return_uint8: bool = False) -> torch.Tensor:
     """Convert a PIL image to a channel-first tensor.
 
     ``uint16`` depth maps become ``float32 (1, H, W)`` in native units (``ToTensor``
     would overflow them to ``int16``); all other modes use the standard ``ToTensor`` path.
+
+    Args:
+        img (`PIL.Image.Image`):
+            The decoded image.
+        return_uint8 (`bool`, *optional*, defaults to `False`):
+            Return the image as raw `uint8` in `[0, 255]` instead of `float32` in `[0, 1]`. Ignored
+            for depth maps, whose native units are not a 0-255 range. This is the same contract
+            `decode_video_frames` offers, and it keeps a quarter of the bytes.
+
+    Returns:
+        `torch.Tensor`: A `(C, H, W)` tensor.
     """
     if img.mode in UINT16_PIL_MODES:
         return torch.from_numpy(np.array(img, dtype=np.float32))[None, ...]
+    if return_uint8:
+        # np.array copies, which is what makes the tensor writable; PIL's own buffer is not.
+        array = np.array(img)
+        if array.ndim == 2:
+            array = array[:, :, None]
+        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
     return transforms.ToTensor()(img)
 
 
-def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[torch.Tensor | str]]:
+def hf_transform_to_torch(
+    items_dict: dict[str, list[Any]], return_uint8: bool = False
+) -> dict[str, list[torch.Tensor | str]]:
     """Convert a batch from a Hugging Face dataset to torch tensors.
 
     This transform function converts items from Hugging Face dataset format (pyarrow)
     to torch tensors. RGB images are converted from PIL objects (H, W, C, uint8)
-    to a torch image representation (C, H, W, float32) in the range [0, 1]. Depth
-    maps are returned as float32 (1, H, W) in their native units. Other
-    types are converted to torch.tensor.
+    to a torch image representation (C, H, W, float32) in the range [0, 1], or to
+    (C, H, W, uint8) in [0, 255] when `return_uint8` is set. Depth maps are returned as
+    float32 (1, H, W) in their native units. Other types are converted to torch.tensor.
 
     Args:
         items_dict (dict): A dictionary representing a batch of data from a
             Hugging Face dataset.
+        return_uint8 (bool): Keep RGB images as raw uint8 instead of normalizing them to
+            float32 in [0, 1]. Defaults to False.
 
     Returns:
         dict: The batch with items converted to torch tensors.
@@ -284,7 +305,7 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
             continue
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
-            items_dict[key] = [pil_to_chw_tensor(img) for img in items_dict[key]]
+            items_dict[key] = [pil_to_chw_tensor(img, return_uint8) for img in items_dict[key]]
         elif first_item is None or isinstance(first_item, dict):
             pass
         else:
