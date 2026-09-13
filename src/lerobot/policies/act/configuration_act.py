@@ -122,6 +122,14 @@ class ACTConfig(PreTrainedConfig):
     dropout: float = 0.1
     kl_weight: float = 10.0
 
+    # torch.compile the model's forward on CUDA. ACT is small enough that a training step is
+    # dominated by kernel launches rather than by the kernels themselves, which is what compiling
+    # addresses. Costs a one-off compilation per batch shape.
+    compile_model: bool = False
+    # Inductor mode; None is its default. "reduce-overhead" uses CUDA graphs, which do not suit a
+    # training step whose inputs change every iteration.
+    compile_mode: str | None = None
+
     # Training preset
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4

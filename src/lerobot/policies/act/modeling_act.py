@@ -65,6 +65,15 @@ class ACTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACT(config)
+        # Compile the bound forward rather than the module, so parameter names and state_dict keys
+        # are untouched and a checkpoint is interchangeable with an uncompiled run. Static shapes:
+        # a dynamic-shape graph is slower here than one graph per shape, and the shapes a training
+        # run sees are a short, fixed list.
+        self._model_forward = (
+            torch.compile(self.model.forward, dynamic=False, mode=config.compile_mode)
+            if config.compile_model
+            else self.model.forward
+        )
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -142,7 +151,7 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat) = self._model_forward(batch)
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
