@@ -263,6 +263,37 @@ def pil_to_chw_tensor(img: PILImage.Image) -> torch.Tensor:
     return transforms.ToTensor()(img)
 
 
+def _column_to_tensors(values: list[Any]) -> list[Any]:
+    """Convert one non-image column of a batch to tensors, in a single call where possible.
+
+    A query with delta indices returns a window of rows, so this list is one entry per row in the
+    window: an action chunk of 100 makes 100 entries, per column. Converting them one at a time
+    costs a `torch.tensor` call each, and that call is not cheap relative to the few floats it
+    converts. Converting the whole column at once and slicing the result gives identical tensors -
+    `torch.tensor` infers the same dtype from a nested list as from its rows - for one call.
+
+    Falls back to per-element conversion for anything the batched call cannot take: strings, ragged
+    rows, mixed types, nulls.
+
+    Args:
+        values (`list`):
+            One column of a batch, as `datasets` handed it over.
+
+    Returns:
+        `list`: The column with every non-string entry converted to a `torch.Tensor`.
+    """
+    if not values or isinstance(values[0], str):
+        return [x if isinstance(x, str) else torch.tensor(x) for x in values]
+    try:
+        if isinstance(values[0], np.ndarray):
+            # torch.tensor on a list of arrays copies one at a time and warns; stack first.
+            return list(torch.from_numpy(np.stack(values)))
+        return list(torch.tensor(values))
+    except (TypeError, ValueError, RuntimeError):
+        # ragged windows, mixed types or nulls: each row still converts on its own
+        return [x if isinstance(x, str) else torch.tensor(x) for x in values]
+
+
 def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[torch.Tensor | str]]:
     """Convert a batch from a Hugging Face dataset to torch tensors.
 
@@ -288,7 +319,7 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
         elif first_item is None or isinstance(first_item, dict):
             pass
         else:
-            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+            items_dict[key] = _column_to_tensors(items_dict[key])
     return items_dict
 
 
