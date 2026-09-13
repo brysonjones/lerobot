@@ -62,6 +62,15 @@ class VQBeTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.vqbet = VQBeTModel(config)
+        # Compile the bound forward rather than the module, so parameter names and state_dict keys
+        # are untouched and a checkpoint is interchangeable with an uncompiled run. Static shapes: a
+        # training run sees a short, fixed list of batch shapes. Only the second training phase goes
+        # through this call; the residual VQ phase has its own path and stays eager.
+        self._vqbet_forward = (
+            torch.compile(self.vqbet.forward, dynamic=False, mode=config.compile_mode)
+            if config.compile_model
+            else self.vqbet.forward
+        )
 
         self.reset()
 
@@ -174,7 +183,7 @@ class VQBeTPolicy(PreTrainedPolicy):
                 "recon_l1_error": recon_l1_error,
             }
         # if Residual VQ is already trained, VQ-BeT trains its GPT and bin prediction head / offset prediction head parts.
-        _, loss_dict = self.vqbet(batch, rollout=False)
+        _, loss_dict = self._vqbet_forward(batch, rollout=False)
         loss = loss_dict.pop("loss")
 
         return loss, loss_dict

@@ -126,6 +126,14 @@ class VQBeTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     optimizer_vqvae_lr: float = 1e-3
     optimizer_vqvae_weight_decay: float = 1e-4
+
+    # torch.compile the model's forward on CUDA, for the second training phase (the GPT and the
+    # prediction heads). VQ-BeT's step is small enough to be dominated by kernel launches, which is
+    # what compiling addresses. Costs a one-off compilation per batch shape.
+    compile_model: bool = False
+    # Inductor mode; None is its default. "reduce-overhead" uses CUDA graphs, which do not suit a
+    # training step whose inputs change every iteration.
+    compile_mode: str | None = None
     scheduler_warmup_steps: int = 500
 
     def __post_init__(self):
