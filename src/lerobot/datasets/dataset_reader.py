@@ -159,6 +159,7 @@ class DatasetReader(BaseDatasetReader):
         self._column_views: dict[str, datasets.Dataset] = {}
         self._column_views_source: datasets.Dataset | None = None
         self._column_views_transform: Callable | None = None
+        self._current_row_view: datasets.Dataset | None = None
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -355,9 +356,27 @@ class DatasetReader(BaseDatasetReader):
             self._column_views = {}
             self._column_views_source = self.hf_dataset
             self._column_views_transform = transform
+            self._current_row_view = None
         if key not in self._column_views:
             self._column_views[key] = self.hf_dataset.select_columns(key)
         return self._column_views[key]
+
+    def _current_row(self, idx: int) -> dict:
+        """Return the row at ``idx``, without the image columns the delta query re-reads.
+
+        A plain row query decodes every embedded image of that row. When a key has delta indices,
+        :meth:`_query_hf_dataset` replaces the value with a stack over the whole window a moment
+        later, so decoding it here is work thrown away: one decode per camera per sample, half as
+        much again as the frames the sample actually needs at ``n_obs_steps=2``. Projecting those
+        columns out of the row query removes it. Keys without delta indices are still read here.
+        """
+        self._column_view("index")  # refreshes the view cache when hf_dataset was (re)loaded
+        if self._current_row_view is None:
+            covered = set(self.delta_indices or {})
+            skipped = covered.intersection(self._meta.image_keys)
+            columns = [name for name in self.hf_dataset.column_names if name not in skipped]
+            self._current_row_view = self.hf_dataset.select_columns(columns) if skipped else self.hf_dataset
+        return self._current_row_view[idx]
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         """Query dataset for indices across keys, skipping video keys."""
@@ -425,7 +444,7 @@ class DatasetReader(BaseDatasetReader):
         if self.hf_dataset is None:
             # One-shot load after finalize()
             self.load_and_activate()
-        item = self.hf_dataset[idx]
+        item = self._current_row(idx)
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 
