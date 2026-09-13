@@ -194,9 +194,16 @@ class AcceleratorConfig:
     `MixedPrecisionPolicy` for sharded runs (accelerate derives it). Sharded runs support
     "no" and "bf16" only; fp16's GradScaler-over-DTensor path is unverified and fails fast
     at config validation.
+
+    `non_blocking` makes accelerate's device placement asynchronous, so a batch's copy overlaps
+    the previous step instead of stalling the main process.
     """
 
     mixed_precision: str = "no"
+    # Overlap the host-to-device copy of each batch with compute. The train dataloaders pin their
+    # batches on CUDA, which is what makes an asynchronous copy possible; accelerate copies them
+    # synchronously unless this is set, so the main process blocks on every batch for nothing.
+    non_blocking: bool = True
     gradient_accumulation: GradientAccumulationConfig = field(default_factory=GradientAccumulationConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     ddp: DDPConfig = field(default_factory=DDPConfig)
@@ -230,10 +237,20 @@ class AcceleratorConfig:
 
         Returns:
             Accelerator: The configured accelerate entry point for this process.
+
+        Note:
+            An asynchronous copy needs pinned source memory to be a copy the host does not wait on.
+            `lerobot-train` pins its train and eval batches on CUDA, so the two settings belong
+            together: `non_blocking` without pinning is merely harmless, pinning without
+            `non_blocking` is wasted.
         """
         from accelerate import Accelerator
+        from accelerate.utils import DataLoaderConfiguration
 
         kwargs: dict = {
+            # The dataloaders pin their batches; without this accelerate still copies them with
+            # `non_blocking=False`, so the pinning buys nothing and the copy cannot overlap compute.
+            "dataloader_config": DataLoaderConfiguration(non_blocking=self.non_blocking),
             # LeRobot steps its scheduler manually once per training step; accelerate must not
             # rescale scheduler stepping by num_processes.
             "step_scheduler_with_optimizer": False,

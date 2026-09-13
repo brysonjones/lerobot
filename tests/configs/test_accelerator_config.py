@@ -56,6 +56,7 @@ class TestDraccusRoundTrip:
             AcceleratorConfig(),
             AcceleratorConfig(
                 mixed_precision="bf16",
+                non_blocking=False,
                 gradient_accumulation=GradientAccumulationConfig(steps=4),
                 fsdp=FSDPConfig(
                     reshard_after_forward=False,
@@ -133,3 +134,21 @@ class TestRuntimeBuilders:
         assert ga_plugin.num_steps == 4
         assert ga_plugin.sync_with_dataloader is False
         assert "gradient_accumulation_steps" not in captured
+
+    @pytest.mark.parametrize("non_blocking", [True, False])
+    def test_dataloader_config_carries_non_blocking(self, monkeypatch, non_blocking):
+        """The batches are pinned, so their copy must be the one accelerate does not wait on."""
+        captured = {}
+
+        class FakeAccelerator:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("accelerate.Accelerator", FakeAccelerator)
+        parallelism = ParallelismConfig()
+        parallelism.resolve(1)
+        AcceleratorConfig(non_blocking=non_blocking).build(parallelism, cpu=True)
+        assert captured["dataloader_config"].non_blocking is non_blocking
+
+    def test_non_blocking_is_the_default(self):
+        assert AcceleratorConfig().non_blocking is True
