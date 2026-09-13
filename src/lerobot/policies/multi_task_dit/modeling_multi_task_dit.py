@@ -204,12 +204,39 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
 class CLIPVisionEncoder(nn.Module):
     """CLIP vision encoder using the CLS token for global image representation."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, trainable_layers: int | None = None):
         super().__init__()
         self.model_name = model_name
         self.model = CLIPVisionModel.from_pretrained(self.model_name)
         self.num_non_spatial_tokens = 1
         self.embed_dim = self.model.config.hidden_size
+        self.trainable_layers = trainable_layers
+        if trainable_layers is not None:
+            self._freeze_all_but_last(trainable_layers)
+
+    def _freeze_all_but_last(self, trainable_layers: int) -> None:
+        """Train only the last `trainable_layers` transformer layers of the tower.
+
+        Everything below them, including the patch embeddings and the pre-layernorm, stops
+        requiring gradients, so the backward pass stops at the first trainable layer. The forward
+        pass is unchanged, so the CLS token this encoder returns is the same function of its input
+        as before for the same weights.
+        """
+        layers = self.model.vision_model.encoder.layers
+        if trainable_layers > len(layers):
+            raise ValueError(
+                f"vision_encoder_trainable_layers={trainable_layers} exceeds the {len(layers)} "
+                f"layers of {self.model_name}."
+            )
+        for param in self.model.parameters():
+            param.requires_grad = False
+        for layer in layers[len(layers) - trainable_layers :] if trainable_layers else []:
+            for param in layer.parameters():
+                param.requires_grad = True
+        if trainable_layers:
+            # The final layernorm sits after the last layer and is cheap, so it trains with it.
+            for param in self.model.vision_model.post_layernorm.parameters():
+                param.requires_grad = True
 
     def forward(self, x: Tensor) -> Tensor:
         """Encode RGB image to CLS token."""
@@ -269,11 +296,20 @@ class ObservationEncoder(nn.Module):
 
             if config.use_separate_rgb_encoder_per_camera:
                 self.vision_encoders = nn.ModuleList(
-                    [CLIPVisionEncoder(model_name=config.vision_encoder_name) for _ in self.camera_names]
+                    [
+                        CLIPVisionEncoder(
+                            model_name=config.vision_encoder_name,
+                            trainable_layers=config.vision_encoder_trainable_layers,
+                        )
+                        for _ in self.camera_names
+                    ]
                 )
                 self.vision_encoder = None
             else:
-                self.vision_encoder = CLIPVisionEncoder(model_name=config.vision_encoder_name)
+                self.vision_encoder = CLIPVisionEncoder(
+                    model_name=config.vision_encoder_name,
+                    trainable_layers=config.vision_encoder_trainable_layers,
+                )
                 self.vision_encoders = None
         else:
             self.vision_encoder = None

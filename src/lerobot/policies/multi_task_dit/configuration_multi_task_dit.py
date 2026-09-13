@@ -72,6 +72,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     vision_encoder_name: str = "openai/clip-vit-base-patch16"  # HuggingFace CLIP model
     use_separate_rgb_encoder_per_camera: bool = False  # Separate encoder per camera view
     vision_encoder_lr_multiplier: float = 0.1  # LR multiplier for vision encoder
+    # How many of the vision encoder's last transformer layers to train. None trains the whole
+    # tower, which is the default and what every existing run does. A number freezes the patch
+    # embeddings and every layer below the last N, which removes their backward pass: the vision
+    # tower is over 90% of a training step, and most of that is its backward.
+    vision_encoder_trainable_layers: int | None = None
     image_resize_shape: tuple[int, int] | None = None  # Resize images before crop
     image_crop_shape: tuple[int, int] | None = (224, 224)  # Crop shape (CLIP default)
     image_crop_is_random: bool = True  # Random crop during training, center at inference
@@ -131,6 +136,12 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             raise ValueError("dropout must be between 0.0 and 1.0")
 
         # Vision encoder validation
+        if self.vision_encoder_trainable_layers is not None and self.vision_encoder_trainable_layers < 0:
+            raise ValueError(
+                "vision_encoder_trainable_layers must be >= 0 or None, got "
+                f"{self.vision_encoder_trainable_layers}."
+            )
+
         if "clip" not in self.vision_encoder_name.lower():
             raise ValueError(
                 f"vision_encoder_name must be a CLIP model (contain 'clip'), got '{self.vision_encoder_name}'"
