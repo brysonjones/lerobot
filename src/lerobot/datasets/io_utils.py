@@ -28,6 +28,7 @@ from datasets import Dataset
 from datasets.table import embed_table_storage
 from PIL import Image as PILImage
 from torchvision import transforms
+from torchvision.io import decode_image
 
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.utils import SuppressProgressBars, flatten_dict, unflatten_dict
@@ -252,6 +253,35 @@ def load_image_as_numpy(
 UINT16_PIL_MODES = {"I;16", "I;16B", "I;16L"}
 
 
+def _is_encoded_image(item: object) -> bool:
+    """Whether a column value is an undecoded image handed back by `datasets`."""
+    return isinstance(item, dict) and "bytes" in item and "path" in item
+
+
+def encoded_to_chw_tensor(encoded: dict) -> torch.Tensor:
+    """Decode a stored image into a channel-first `uint8` tensor without going through PIL.
+
+    `datasets` hands back `{"bytes": ..., "path": ...}` for an image column declared with
+    `decode=False`. torchvision decodes those bytes straight into the `(C, H, W)` `uint8` layout the
+    rest of the pipeline wants, where the PIL path decodes, converts to a numpy array and then
+    permutes - about twice the time for a 256x256 PNG.
+
+    Args:
+        encoded (`dict`):
+            An undecoded image column value. `bytes` holds the encoded image; if it is None, `path`
+            names a file to read instead.
+
+    Returns:
+        `torch.Tensor`: A `(C, H, W)` `uint8` tensor.
+    """
+    data = encoded.get("bytes")
+    if data is None:
+        data = Path(encoded["path"]).read_bytes()
+    # frombuffer needs a writable buffer to hand torchvision; bytearray avoids a second copy of the
+    # decoded image, which is the larger of the two.
+    return decode_image(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+
+
 def pil_to_chw_tensor(img: PILImage.Image) -> torch.Tensor:
     """Convert a PIL image to a channel-first tensor.
 
@@ -285,8 +315,11 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
             items_dict[key] = [pil_to_chw_tensor(img) for img in items_dict[key]]
+        elif _is_encoded_image(first_item):
+            frames = [encoded_to_chw_tensor(item) for item in items_dict[key]]
+            items_dict[key] = [f.to(torch.float32) / 255.0 for f in frames]
         elif first_item is None or isinstance(first_item, dict):
-            pass
+            pass  # an undecoded image is handled above; anything else is left alone
         else:
             items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
     return items_dict

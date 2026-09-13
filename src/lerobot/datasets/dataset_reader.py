@@ -159,6 +159,7 @@ class DatasetReader(BaseDatasetReader):
         self._column_views: dict[str, datasets.Dataset] = {}
         self._column_views_source: datasets.Dataset | None = None
         self._column_views_transform: Callable | None = None
+        self._undecoded_keys: tuple[str, ...] | None = None
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -356,8 +357,44 @@ class DatasetReader(BaseDatasetReader):
             self._column_views_source = self.hf_dataset
             self._column_views_transform = transform
         if key not in self._column_views:
-            self._column_views[key] = self.hf_dataset.select_columns(key)
+            self._column_views[key] = self._as_undecoded(self.hf_dataset.select_columns(key))
         return self._column_views[key]
+
+    def _undecoded_image_keys(self) -> tuple[str, ...]:
+        """Image columns this reader decodes itself, rather than letting `datasets` do it.
+
+        Depth maps are excluded: they are 16-bit and PIL is what reads their native units.
+        """
+        if self._undecoded_keys is None:
+            depth = set(self._meta.depth_keys)
+            self._undecoded_keys = tuple(k for k in self._meta.image_keys if k not in depth)
+        return self._undecoded_keys
+
+    def _as_undecoded(self, view: datasets.Dataset) -> datasets.Dataset:
+        """Return `view` with its image columns handed over as stored bytes.
+
+        `cast_column` here is a schema change, not a conversion, so this costs nothing per row. It
+        applies to the reader's own queries only: `self.hf_dataset` still decodes to PIL images for
+        everything else that reads the dataset, including the tools that strip the transform.
+
+        `cast_column` returns a view with the default format, so the transform has to be put back.
+        It is taken from `hf_dataset` rather than named directly: whatever options the reader bound
+        into it must survive into the view, or the view quietly runs a different conversion.
+        """
+        keys = [key for key in self._undecoded_image_keys() if key in view.column_names]
+        if not keys:
+            return view
+        for key in keys:
+            view = view.cast_column(key, datasets.Image(decode=False))
+        view.set_transform(self.hf_dataset.format["format_kwargs"].get("transform"))
+        return view
+
+    def _row_view(self) -> datasets.Dataset:
+        """The whole-row view used for the current frame, with images left encoded."""
+        self._column_view("index")  # refreshes the view cache when hf_dataset was (re)loaded
+        if "__row__" not in self._column_views:
+            self._column_views["__row__"] = self._as_undecoded(self.hf_dataset)
+        return self._column_views["__row__"]
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         """Query dataset for indices across keys, skipping video keys."""
@@ -425,7 +462,7 @@ class DatasetReader(BaseDatasetReader):
         if self.hf_dataset is None:
             # One-shot load after finalize()
             self.load_and_activate()
-        item = self.hf_dataset[idx]
+        item = self._row_view()[idx]
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 
