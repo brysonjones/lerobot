@@ -243,9 +243,11 @@ def update_policy(
     ):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    # Recorded as tensors: the meters accumulate them on the accelerator and read them back once
+    # per logging window, so the step does not end by blocking the host on the whole graph.
+    train_metrics.loss = loss.detach()
     if grad_norm is not None:
-        train_metrics.grad_norm = grad_norm.item()
+        train_metrics.grad_norm = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else grad_norm
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available():

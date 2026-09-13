@@ -49,20 +49,56 @@ class AverageMeter:
         self.reset()
 
     def reset(self) -> None:
-        self.val = 0.0
-        self.avg = 0.0
-        self.sum = 0.0
+        self._val: float | torch.Tensor = 0.0
+        self._sum: float | torch.Tensor = 0.0
         self.count = 0.0
 
-    def update(self, val: float, n: int = 1) -> None:
-        self.val = val
-        self.sum += val * n
+    @property
+    def val(self) -> float:
+        """The last value recorded."""
+        return float(self._val)
+
+    @val.setter
+    def val(self, value: float | torch.Tensor) -> None:
+        self._val = value
+
+    @property
+    def sum(self) -> float:
+        """The running sum of the recorded values, weighted by their counts."""
+        return float(self._sum)
+
+    @sum.setter
+    def sum(self, value: float | torch.Tensor) -> None:
+        self._sum = value
+
+    @property
+    def avg(self) -> float:
+        """The running average of the recorded values."""
+        return float(self._sum) / self.count if self.count else 0.0
+
+    @avg.setter
+    def avg(self, value: float) -> None:
+        # Keep avg == sum / count so a later update() accumulates against the value just written.
+        self._sum = value * self.count
+
+    def update(self, val: float | torch.Tensor, n: int = 1) -> None:
+        """Record one value.
+
+        Args:
+            val (`float | torch.Tensor`):
+                The value to record. A zero-dimensional tensor is accumulated on its own device and
+                only read back when an average is requested, so a metric taken from a live training
+                step does not synchronize the host with the accelerator.
+            n (`int`, *optional*, defaults to `1`):
+                How many observations `val` stands for.
+        """
+        self._val = val
+        self._sum = self._sum + val * n
         self.count += n
-        self.avg = self.sum / self.count
 
     def __str__(self):
         fmtstr = "{name}:{avg" + self.fmt + "}"
-        return fmtstr.format(**self.__dict__)
+        return fmtstr.format(name=self.name, avg=self.avg)
 
 
 class MetricsTracker:
@@ -184,17 +220,26 @@ class MetricsTracker:
     def update_metrics(self, values: dict[str, Any]) -> None:
         """Accumulate a dict of scalar metrics, auto-registering a meter for each new key.
 
-        Non-numeric values and bools are ignored.
-        Caller-registered metrics (those passed to the constructor) are never overridden.
+        Zero-dimensional tensors are accumulated on their own device and read back only when an
+        average is requested, so a policy may return its sub-losses as tensors rather than
+        synchronizing the host to turn them into floats. Non-numeric values, bools and tensors with
+        more than zero dimensions are ignored. Caller-registered metrics (those passed to the
+        constructor) are never overridden.
         """
         for name, value in values.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if isinstance(value, torch.Tensor):
+                if value.ndim != 0:
+                    continue
+                value = value.detach()
+            elif isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
+            else:
+                value = float(value)
             if name in self._caller_metrics:
                 continue
             if name not in self.metrics:
                 self.metrics[name] = AverageMeter(name, ":.3f", reduction="mean")
-            self.metrics[name].update(float(value))
+            self.metrics[name].update(value)
 
     def reduce_across_ranks(self) -> None:
         """

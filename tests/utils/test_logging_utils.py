@@ -239,3 +239,56 @@ def test_metrics_tracker_update_metrics_does_not_override_caller_meter():
 
     assert tracker.metrics["loss"].avg == pytest.approx(1.0)  # snapshot ignored
     assert tracker.metrics["latent_loss"].avg == pytest.approx(0.2)
+
+
+def test_average_meter_accumulates_tensors_without_reading_them():
+    """A tensor metric must be summed on its own device; reading it back is the caller's choice."""
+    meter = AverageMeter("loss", ":.3f")
+    meter.update(torch.tensor(2.0))
+    meter.update(torch.tensor(4.0))
+    assert isinstance(meter._sum, torch.Tensor)
+    assert meter.avg == pytest.approx(3.0)
+    assert meter.val == pytest.approx(4.0)
+    assert meter.sum == pytest.approx(6.0)
+
+
+def test_average_meter_mixes_tensor_and_float_updates():
+    meter = AverageMeter("loss", ":.3f")
+    meter.update(1.0)
+    meter.update(torch.tensor(3.0))
+    assert meter.avg == pytest.approx(2.0)
+    assert str(meter) == "loss:2.000"
+
+
+def test_average_meter_weighted_tensor_update():
+    meter = AverageMeter("loss", ":.3f")
+    meter.update(torch.tensor(2.0), n=3)
+    assert meter.count == 3
+    assert meter.avg == pytest.approx(2.0)
+
+
+def test_average_meter_avg_setter_keeps_sum_consistent():
+    """reduce_across_ranks overwrites the window average with the cluster view."""
+    meter = AverageMeter("loss", ":.3f")
+    meter.update(torch.tensor(1.0))
+    meter.update(torch.tensor(3.0))
+    meter.avg = 10.0
+    assert meter.sum == pytest.approx(20.0)
+    meter.update(torch.tensor(4.0))
+    assert meter.avg == pytest.approx(8.0)
+
+
+def test_update_metrics_accepts_zero_dim_tensors():
+    tracker = MetricsTracker(1, 10, 2, {"loss": AverageMeter("loss", ":.3f")})
+    tracker.update_metrics({"latent_loss": torch.tensor(0.5), "vector": torch.ones(3), "flag": True})
+    assert "vector" not in tracker.metrics
+    assert "flag" not in tracker.metrics
+    assert tracker.metrics["latent_loss"].avg == pytest.approx(0.5)
+
+
+def test_update_metrics_detaches_tensors():
+    """A retained graph would keep a step's activations alive for the whole logging window."""
+    tracker = MetricsTracker(1, 10, 2, {"loss": AverageMeter("loss", ":.3f")})
+    value = (torch.ones(1, requires_grad=True) * 2).sum()
+    tracker.update_metrics({"sub_loss": value})
+    assert not tracker.metrics["sub_loss"]._sum.requires_grad
