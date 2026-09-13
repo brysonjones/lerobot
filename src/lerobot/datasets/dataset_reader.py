@@ -159,6 +159,12 @@ class DatasetReader(BaseDatasetReader):
         self._column_views: dict[str, datasets.Dataset] = {}
         self._column_views_source: datasets.Dataset | None = None
         self._column_views_transform: Callable | None = None
+        # Per-sample lookups that do not change while a dataset is being read. Each is a row fetch
+        # or a comprehension over the feature dict, and `get_item` performs several of each.
+        self._episode_rows: dict[int, dict] = {}
+        self._key_groups: dict[str, list[str]] | None = None
+        self._task_names: list[str] | None = None
+        self._video_paths: dict[tuple[int, str], Path] = {}
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -228,7 +234,15 @@ class DatasetReader(BaseDatasetReader):
         self._validate_language_columns_declared(features)
         hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
         hf_dataset.set_transform(hf_transform_to_torch)
+        self._reset_lookup_caches()
         return hf_dataset
+
+    def _reset_lookup_caches(self) -> None:
+        """Drop the per-sample lookup caches; the dataset they describe has been (re)loaded."""
+        self._episode_rows = {}
+        self._key_groups = None
+        self._task_names = None
+        self._video_paths = {}
 
     def _validate_language_columns_declared(self, features: datasets.Features) -> None:
         """Require language columns stored in Parquet to be declared in metadata."""
@@ -271,7 +285,7 @@ class DatasetReader(BaseDatasetReader):
         if not requested_episodes.issubset(available_episodes):
             return False
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._keys("video")) > 0:
             for ep_idx in requested_episodes:
                 for vid_key in self._meta.video_keys:
                     video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
@@ -287,7 +301,7 @@ class DatasetReader(BaseDatasetReader):
         """
         episodes = self.episodes if self.episodes is not None else list(range(self._meta.total_episodes))
         fpaths = [str(self._meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
-        if len(self._meta.video_keys) > 0:
+        if len(self._keys("video")) > 0:
             video_files = [
                 str(self._meta.get_video_file_path(ep_idx, vid_key))
                 for vid_key in self._meta.video_keys
@@ -298,11 +312,57 @@ class DatasetReader(BaseDatasetReader):
         fpaths = list(set(fpaths))
         return fpaths
 
+    def _episode(self, ep_index: int) -> dict:
+        """Return an episode's metadata row, fetched once per episode rather than per sample.
+
+        `get_item` reads this row up to four times for one sample: for the episode bounds, for the
+        video start offsets, and once per camera inside `get_video_file_path`. Each read is a row
+        query against the episodes dataset.
+        """
+        row = self._episode_rows.get(ep_index)
+        if row is None:
+            row = self._meta.episodes[ep_index]
+            self._episode_rows[ep_index] = row
+        return row
+
+    def _video_path(self, ep_index: int, vid_key: str) -> Path:
+        """Return a camera's video file for an episode, resolved once per episode and camera.
+
+        Resolving it reads the episode's metadata row for the chunk and file indices, which is one
+        more row query per camera per sample.
+        """
+        key = (ep_index, vid_key)
+        path = self._video_paths.get(key)
+        if path is None:
+            path = self.root / self._meta.get_video_file_path(ep_index, vid_key)
+            self._video_paths[key] = path
+        return path
+
+    def _keys(self, group: str) -> list[str]:
+        """Return one of the cached key groups (``video``, ``depth`` or ``camera``).
+
+        The metadata builds each of these by walking the feature dict, and `get_item` asks for them
+        a dozen times per sample.
+        """
+        if self._key_groups is None:
+            self._key_groups = {
+                "video": list(self._meta.video_keys),
+                "depth": list(self._meta.depth_keys),
+                "camera": list(self._meta.camera_keys),
+            }
+        return self._key_groups[group]
+
+    def _task_name(self, task_index: int) -> str:
+        """Return a task's name without materializing a pandas row per sample."""
+        if self._task_names is None:
+            self._task_names = list(self._meta.tasks.index)
+        return self._task_names[task_index]
+
     def _get_query_indices(
         self, abs_idx: int, ep_idx: int
     ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
         """Compute query indices for delta timestamps."""
-        ep = self._meta.episodes[ep_idx]
+        ep = self._episode(ep_idx)
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
         query_indices = {
@@ -323,7 +383,7 @@ class DatasetReader(BaseDatasetReader):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self._meta.video_keys:
+        for key in self._keys("video"):
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
@@ -363,7 +423,7 @@ class DatasetReader(BaseDatasetReader):
         """Query dataset for indices across keys, skipping video keys."""
         result: dict = {}
         for key, q_idx in query_indices.items():
-            if key in self._meta.video_keys:
+            if key in self._keys("video"):
                 continue
             relative_indices = (
                 q_idx
@@ -378,21 +438,21 @@ class DatasetReader(BaseDatasetReader):
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
         Segmentation Fault.
         """
-        ep = self._meta.episodes[ep_idx]
+        ep = self._episode(ep_idx)
 
         def _decode_single(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor]:
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
-            video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
+            video_path = self._video_path(ep_idx, vid_key)
             frames = decode_video_frames(
                 video_path,
                 shifted_query_ts,
                 self._tolerance_s,
                 self._video_backend,
                 return_uint8=self._return_uint8,
-                is_depth=vid_key in self._meta.depth_keys,
+                is_depth=vid_key in self._keys("depth"),
             )
-            if vid_key in self._meta.depth_keys:
+            if vid_key in self._keys("depth"):
                 depth_encoder = self._depth_encoder_configs[vid_key]
                 frames = dequantize_depth(
                     frames,
@@ -437,15 +497,15 @@ class DatasetReader(BaseDatasetReader):
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._keys("video")) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self._image_transforms is not None:
-            for cam in self._meta.camera_keys:
-                if cam in self._meta.depth_keys:
+            for cam in self._keys("camera"):
+                if cam in self._keys("depth"):
                     continue
                 item[cam] = self._image_transforms(item[cam])
 
@@ -458,6 +518,6 @@ class DatasetReader(BaseDatasetReader):
 
         # Add task as a string
         task_idx = item["task_index"].item()
-        item["task"] = self._meta.tasks.iloc[task_idx].name
+        item["task"] = self._task_name(task_idx)
 
         return item
