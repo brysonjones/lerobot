@@ -397,15 +397,15 @@ class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
+        # The frequencies depend only on `dim`, so they are built once instead of on every call.
+        # Not persistent: they are derived from the configuration, not learned.
+        half_dim = dim // 2
+        decay = math.log(10000) / (half_dim - 1)
+        self.register_buffer("frequencies", torch.exp(torch.arange(half_dim) * -decay), persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+        emb = x[:, None] * self.frequencies.to(device=x.device, dtype=x.dtype)[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -429,6 +429,9 @@ class RotaryPositionalEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("_cos_cached", emb.cos()[None, None, :, :], persistent=False)
         self.register_buffer("_sin_cached", emb.sin()[None, None, :, :], persistent=False)
+        # The tables cast to whatever dtype and device the queries arrive in; see `forward`.
+        self._cos_cast = self._cos_cached
+        self._sin_cast = self._sin_cached
 
     def _rotate_half(self, x: Tensor) -> Tensor:
         x1 = x[..., : x.shape[-1] // 2]
@@ -440,8 +443,13 @@ class RotaryPositionalEmbedding(nn.Module):
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}.")
 
-        cos = self._cos_cached[:, :, :seq_len, :].to(q.dtype)
-        sin = self._sin_cached[:, :, :seq_len, :].to(q.dtype)
+        # Under autocast the cached tables are one dtype and the queries another, so the cast used
+        # to run once per attention layer per step. Keep the cast result for the dtype in use.
+        if self._cos_cast.dtype != q.dtype or self._cos_cast.device != q.device:
+            self._cos_cast = self._cos_cached.to(device=q.device, dtype=q.dtype)
+            self._sin_cast = self._sin_cached.to(device=q.device, dtype=q.dtype)
+        cos = self._cos_cast[:, :, :seq_len, :]
+        sin = self._sin_cast[:, :, :seq_len, :]
 
         q_rotated = (q * cos) + (self._rotate_half(q) * sin)
         k_rotated = (k * cos) + (self._rotate_half(k) * sin)
@@ -667,6 +675,10 @@ class DiffusionObjective(nn.Module):
 
     def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
         clean_actions = batch[ACTION]
+        # The scheduler is a plain diffusers object, not a module, so its tables stay wherever they
+        # were built. `add_noise` would otherwise copy them from the host on every step.
+        if self.noise_scheduler.alphas_cumprod.device != clean_actions.device:
+            self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(clean_actions.device)
         noise = torch.randn_like(clean_actions)
         timesteps = torch.randint(
             low=0,
