@@ -30,7 +30,12 @@ from torch import Tensor, nn
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
-from ..utils import get_device_from_parameters, get_output_shape, populate_queues
+from ..utils import (
+    RandomCropPerSample,
+    get_device_from_parameters,
+    get_output_shape,
+    populate_queues,
+)
 from .configuration_vqbet import VQBeTConfig
 from .vqbet_utils import GPT, ResidualVQ
 
@@ -662,7 +667,7 @@ class VQBeTRgbEncoder(nn.Module):
             # Always use center crop for eval
             self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
             if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
+                self.maybe_random_crop = RandomCropPerSample(config.crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:

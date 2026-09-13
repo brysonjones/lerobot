@@ -19,7 +19,7 @@ from collections import deque
 
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.lerobot_types import PolicyAction, RobotAction, RobotObservation
@@ -255,3 +255,62 @@ def validate_visual_features_consistency(
 
     if not (policy_subset_of_dataset or dataset_subset_of_policy):
         raise_feature_mismatch_error(provided_visuals, expected_visuals)
+
+
+class RandomCropPerSample(nn.Module):
+    """Crop every image of a batch at its own random position.
+
+    A drop-in replacement for `torchvision.transforms.v2.RandomCrop` on a batched tensor, without
+    the padding options. Torchvision draws one position per *call*, so handing it a whole batch
+    crops every image the same way and the augmentation adds one degree of freedom per step instead
+    of one per image. This draws one position per image, like the random shift used by the
+    reinforcement-learning replay buffer.
+
+    Args:
+        size (`int | tuple[int, int]`):
+            Output size as `(height, width)`, or one number for a square crop.
+
+    Example:
+        ```python
+        >>> import torch
+        >>> from lerobot.policies.utils import RandomCropPerSample
+        >>> crop = RandomCropPerSample((84, 84))
+        >>> crop(torch.rand(8, 3, 96, 96)).shape
+        torch.Size([8, 3, 84, 84])
+        ```
+    """
+
+    def __init__(self, size: int | tuple[int, int]):
+        super().__init__()
+        height, width = (size, size) if isinstance(size, int) else tuple(size)
+        self.size = (int(height), int(width))
+
+    def forward(self, images: Tensor) -> Tensor:
+        """Crop a batch of images.
+
+        Args:
+            images (`torch.Tensor`):
+                A `(B, C, H, W)` batch. `H` and `W` must be at least the crop size.
+
+        Returns:
+            `torch.Tensor`: The `(B, C, crop_h, crop_w)` crops, one random position per image.
+
+        Raises:
+            ValueError: If the requested crop is larger than the images.
+        """
+        batch_size, _, height, width = images.shape
+        crop_h, crop_w = self.size
+        if crop_h > height or crop_w > width:
+            raise ValueError(
+                f"Requested crop size {self.size} is larger than the input size {(height, width)}."
+            )
+        device = images.device
+        tops = torch.randint(0, height - crop_h + 1, (batch_size,), device=device)
+        lefts = torch.randint(0, width - crop_w + 1, (batch_size,), device=device)
+        rows = torch.arange(crop_h, device=device).unsqueeze(0) + tops.unsqueeze(1)
+        cols = torch.arange(crop_w, device=device).unsqueeze(0) + lefts.unsqueeze(1)
+        cropped = images.take_along_dim(rows.view(batch_size, 1, crop_h, 1), dim=2)
+        return cropped.take_along_dim(cols.view(batch_size, 1, 1, crop_w), dim=3)
+
+    def extra_repr(self) -> str:
+        return f"size={self.size}"

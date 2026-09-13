@@ -62,7 +62,7 @@ from lerobot.utils.constants import (
 )
 
 from ..pretrained import PreTrainedPolicy
-from ..utils import populate_queues
+from ..utils import RandomCropPerSample, populate_queues
 
 # -- Policy --
 
@@ -313,7 +313,7 @@ class ObservationEncoder(nn.Module):
             self.do_crop = True
             self.center_crop = torchvision.transforms.CenterCrop(config.image_crop_shape)
             if config.image_crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.image_crop_shape)
+                self.maybe_random_crop = RandomCropPerSample(config.image_crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:

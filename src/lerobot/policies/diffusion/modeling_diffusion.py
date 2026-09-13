@@ -45,6 +45,7 @@ else:
 
 from ..pretrained import PreTrainedPolicy
 from ..utils import (
+    RandomCropPerSample,
     get_device_from_parameters,
     get_dtype_from_parameters,
     get_output_shape,
@@ -491,7 +492,7 @@ class DiffusionRgbEncoder(nn.Module):
             # Always use center crop for eval
             self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
             if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+                self.maybe_random_crop = RandomCropPerSample(crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:
