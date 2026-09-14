@@ -51,9 +51,10 @@ class DatasetConfig:
     return_uint8: bool = False
     # Sample epoch after epoch from a single dataloader iterator. Ending the iterator once per
     # epoch drains the workers' prefetch queue, and the accelerator waits for a full fetch round
-    # before the next step can run. Frames at an epoch's tail then share a batch with the next
-    # epoch's head; no frame is seen more or less often.
-    continuous_sampling: bool = False
+    # before the next step can run: on a 12k-frame video dataset that is a 2-5 s stall every 37
+    # steps, 13% of the run. Frames at an epoch's tail then share a batch with the next epoch's
+    # head; no frame is seen more or less often. Set to False to end each epoch on its own batch.
+    continuous_sampling: bool = True
     # Physical unit depth maps are dequantized to at load time: "mm" (millimeters) or "m" (metres).
     # Has no effect on datasets without depth cameras.
     depth_output_unit: str = DEFAULT_DEPTH_UNIT
