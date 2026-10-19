@@ -71,6 +71,9 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     # z-loss weight on logsumexp(logits)^2 (PaLM). Cross-entropy on bits the canvas already shows has no
     # finite optimum, so without it the logits sharpen for the whole run until a step diverges.
     grn_z_loss: float = 0.0
+    # Soft cap on each bit's logits, c * tanh(logits / c) (Gemma 2). With two classes the z-loss only removes
+    # the shared offset; this bounds the margin itself, which otherwise grows for the whole run. 0 disables.
+    grn_logit_softcap: float = 0.0
     grn_cfg_scale: float = 1.0  # Classifier-free guidance on the task text; 1.0 disables it
     grn_cfg_min_retention: float = 0.0  # Guidance applies only from this refinement level onwards
     # Complexity-aware sampling (paper Eq. 9, reference C2I sampler): after `grn_adaptive_warmup` passes,

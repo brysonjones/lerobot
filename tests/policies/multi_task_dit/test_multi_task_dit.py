@@ -970,3 +970,25 @@ def test_grn_z_loss_penalizes_large_logits():
 
     assert losses[0.0] < 1e-6
     assert losses[1e-4] == pytest.approx(1e-4 * 50.0**2, rel=1e-3)
+
+
+def test_grn_logit_softcap_bounds_the_bit_margin():
+    config = create_grn_config(grn_logit_softcap=2.0)
+    policy = MultiTaskDiTPolicy(config=config)
+    with torch.no_grad():
+        policy.noise_predictor.output_proj.bias.normal_(std=100.0)  # would give margins in the hundreds
+        policy.noise_predictor.final_modulation[-1].bias.zero_()
+    batch = policy._prepare_batch(create_processed_train_batch(copy_config(config)))
+    conditioning = policy.observation_encoder.encode(batch)
+    canvas = torch.randint(0, 2, (2, 16, policy.noise_predictor.num_bits))
+
+    logits = policy.noise_predictor(canvas, torch.full((2,), 0.5), conditioning)
+
+    assert logits.abs().max() <= 2.0
+    assert (logits[..., 1] - logits[..., 0]).abs().max() <= 4.0
+
+
+def copy_config(config: MultiTaskDiTConfig) -> MultiTaskDiTConfig:
+    import copy
+
+    return copy.deepcopy(config)

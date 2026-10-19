@@ -716,7 +716,9 @@ class DiffusionTransformer(nn.Module):
         if self.is_grn:
             shift, scale = self.final_modulation(cond_features).chunk(2, dim=-1)
             hidden_seq = modulate(self.final_norm(hidden_seq), shift.unsqueeze(1), scale.unsqueeze(1))
-            return self.output_proj(hidden_seq).unflatten(-1, (self.num_bits, 2))
+            logits = self.output_proj(hidden_seq).unflatten(-1, (self.num_bits, 2))
+            cap = self.config.grn_logit_softcap
+            return cap * torch.tanh(logits / cap) if cap > 0 else logits
         return self.output_proj(hidden_seq)
 
 
