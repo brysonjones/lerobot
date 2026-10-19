@@ -716,9 +716,7 @@ class DiffusionTransformer(nn.Module):
         if self.is_grn:
             shift, scale = self.final_modulation(cond_features).chunk(2, dim=-1)
             hidden_seq = modulate(self.final_norm(hidden_seq), shift.unsqueeze(1), scale.unsqueeze(1))
-            logits = self.output_proj(hidden_seq).unflatten(-1, (self.num_bits, 2))
-            cap = self.config.grn_logit_softcap
-            return cap * torch.tanh(logits / cap) if cap > 0 else logits
+            return self.output_proj(hidden_seq).unflatten(-1, (self.num_bits, 2))
         return self.output_proj(hidden_seq)
 
 
@@ -987,8 +985,6 @@ class GRNObjective(nn.Module):
         logits = model(canvas, retention, conditioning_vec=conditioning_vec)
         loss = F.cross_entropy(logits.float().flatten(0, 2), target.flatten(), reduction="none")
         loss = loss.view_as(target)
-        if self.config.grn_z_loss > 0:
-            loss = loss + self.config.grn_z_loss * logits.float().logsumexp(dim=-1).square()
 
         with torch.no_grad():
             correct = (logits.argmax(dim=-1) == target).float()
