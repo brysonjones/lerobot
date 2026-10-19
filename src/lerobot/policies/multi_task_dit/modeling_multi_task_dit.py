@@ -985,6 +985,8 @@ class GRNObjective(nn.Module):
         logits = model(canvas, retention, conditioning_vec=conditioning_vec)
         loss = F.cross_entropy(logits.float().flatten(0, 2), target.flatten(), reduction="none")
         loss = loss.view_as(target)
+        if self.config.grn_z_loss > 0:
+            loss = loss + self.config.grn_z_loss * logits.float().logsumexp(dim=-1).square()
 
         with torch.no_grad():
             correct = (logits.argmax(dim=-1) == target).float()

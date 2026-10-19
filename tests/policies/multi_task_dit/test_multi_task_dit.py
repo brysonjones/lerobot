@@ -949,3 +949,24 @@ def test_qk_norm_policy_trains_and_round_trips(tmp_path):
     policy.save_pretrained(tmp_path)
     loaded = MultiTaskDiTPolicy.from_pretrained(tmp_path)
     assert isinstance(loaded.noise_predictor.transformer_blocks[0].attn.q_norm, torch.nn.RMSNorm)
+
+
+def test_grn_z_loss_penalizes_large_logits():
+    """Confident, correct logits cost ~0 cross-entropy; the z-loss is what keeps them from growing."""
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import GRNObjective, actions_to_bits
+
+    actions = torch.rand(2, 16, 3) * 2 - 1
+    target = actions_to_bits(actions, 8)
+
+    class Confident(torch.nn.Module):
+        def forward(self, canvas, level, conditioning_vec):
+            return torch.nn.functional.one_hot(target, 2).float() * 50.0
+
+    losses = {}
+    for z in (0.0, 1e-4):
+        config = create_grn_config(action_dim=3, grn_z_loss=z)
+        objective = GRNObjective(config, action_dim=3, horizon=16)
+        losses[z] = objective.compute_loss(Confident(), {ACTION: actions}, torch.zeros(2, 1)).item()
+
+    assert losses[0.0] < 1e-6
+    assert losses[1e-4] == pytest.approx(1e-4 * 50.0**2, rel=1e-3)

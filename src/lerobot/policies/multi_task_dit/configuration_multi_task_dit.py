@@ -68,6 +68,9 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     grn_retention_p_mean: float = -0.8  # Training retention ~ sigmoid(N(p_mean, p_std)), as in the
     grn_retention_p_std: float = 0.8  # paper's released class-to-image recipe
     grn_temperature: float = 1.0  # Softmax temperature when sampling each bit
+    # z-loss weight on logsumexp(logits)^2 (PaLM). Cross-entropy on bits the canvas already shows has no
+    # finite optimum, so without it the logits sharpen for the whole run until a step diverges.
+    grn_z_loss: float = 0.0
     grn_cfg_scale: float = 1.0  # Classifier-free guidance on the task text; 1.0 disables it
     grn_cfg_min_retention: float = 0.0  # Guidance applies only from this refinement level onwards
     # Complexity-aware sampling (paper Eq. 9, reference C2I sampler): after `grn_adaptive_warmup` passes,
