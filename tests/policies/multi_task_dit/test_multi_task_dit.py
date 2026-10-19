@@ -871,3 +871,52 @@ def test_grn_adaptive_steps_follow_prediction_entropy():
     # Warmup (5) plus 30 * H + 10 passes.
     assert objective.last_num_steps.tolist() == [15.0, 15.0, 45.0, 45.0]
     assert model.calls == 45
+
+
+def test_flow_matching_guidance_combines_conditional_and_null_velocities():
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import FlowMatchingObjective
+
+    config = create_config()
+    config.objective, config.text_dropout_prob, config.flow_cfg_scale = "flow_matching", 0.1, 3.0
+    config.num_integration_steps = 1
+    config.__post_init__()
+    objective = FlowMatchingObjective(config, action_dim=10, horizon=16)
+
+    class ConditioningAsVelocity(torch.nn.Module):
+        """Velocity equals the first conditioning entry, so cond=2 and null=1 are easy to combine."""
+
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x, t, conditioning_vec):
+            return conditioning_vec[:, :1, None].expand_as(x).clone()
+
+    torch.manual_seed(0)
+    start = torch.randn(2, 16, 10)
+    torch.manual_seed(0)
+    out = objective.conditional_sample(
+        ConditioningAsVelocity(), 2, torch.full((2, 1), 2.0), uncond_vec=torch.full((2, 1), 1.0)
+    )
+
+    # One Euler step of size 1 with guided velocity 1 + 3 * (2 - 1) = 4.
+    assert torch.allclose(out, start + 4.0)
+
+
+def test_flow_matching_guidance_requires_text_dropout():
+    config = create_config()
+    config.objective, config.flow_cfg_scale = "flow_matching", 2.0
+    with pytest.raises(ValueError, match="text_dropout_prob"):
+        config.__post_init__()
+
+
+def test_flow_matching_guided_select_action():
+    config = create_config()
+    config.objective, config.text_dropout_prob, config.flow_cfg_scale = "flow_matching", 0.1, 2.0
+    config.num_integration_steps = 3
+    config.__post_init__()
+    policy = MultiTaskDiTPolicy(config=config).eval()
+    preprocessor, _ = make_multi_task_dit_pre_post_processors(config=config, dataset_stats=None)
+    with torch.no_grad():
+        action = policy.select_action(preprocessor(create_observation_batch()))
+    assert action.shape == (2, 10)

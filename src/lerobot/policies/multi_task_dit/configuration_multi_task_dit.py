@@ -57,6 +57,7 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     timestep_sampling_s: float = 0.999  # (beta only) Max timestep threshold
     timestep_sampling_alpha: float = 1.5  # (beta only) Beta distribution alpha
     timestep_sampling_beta: float = 1.0  # (beta only) Beta distribution beta
+    flow_cfg_scale: float = 1.0  # Classifier-free guidance on the task text's velocity; 1.0 disables it
 
     # --- GRN-specific (used when objective="grn") ---
     # Generative Refinement Networks (Han et al., arXiv 2604.13030): each normalized action dimension is
@@ -225,6 +226,10 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                     raise ValueError("timestep_sampling_alpha must be positive")
                 if self.timestep_sampling_beta <= 0:
                     raise ValueError("timestep_sampling_beta must be positive")
+            if self.flow_cfg_scale != 1.0 and self.text_dropout_prob == 0.0:
+                raise ValueError(
+                    "flow_cfg_scale != 1 needs a null text embedding: train with text_dropout_prob > 0"
+                )
 
         elif self.objective == "grn":
             if not (1 <= self.grn_action_bits <= 16):

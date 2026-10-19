@@ -145,7 +145,10 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         assert n_obs_steps == self.config.n_obs_steps
 
         conditioning_vec = self.observation_encoder.encode(batch)
-        if isinstance(self.objective, GRNObjective) and self.config.grn_cfg_scale != 1.0:
+        guided = (self.config.is_grn and self.config.grn_cfg_scale != 1.0) or (
+            self.config.is_flow_matching and self.config.flow_cfg_scale != 1.0
+        )
+        if guided and isinstance(self.objective, GRNObjective | FlowMatchingObjective):
             actions = self.objective.conditional_sample(
                 self.noise_predictor,
                 batch_size,
@@ -839,11 +842,28 @@ class FlowMatchingObjective(nn.Module):
 
         return loss.mean()
 
-    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
+    def conditional_sample(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        conditioning_vec: Tensor,
+        uncond_vec: Tensor | None = None,
+    ) -> Tensor:
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
 
         x = torch.randn((batch_size, self.horizon, self.action_dim), dtype=dtype, device=device)
+
+        if uncond_vec is not None:
+            # Classifier-free guidance on the velocity; both integrators see one guided field.
+            denoiser, scale = model, self.config.flow_cfg_scale
+
+            def model(x_t: Tensor, t: Tensor, conditioning_vec: Tensor) -> Tensor:
+                velocity = denoiser(
+                    torch.cat([x_t, x_t]), torch.cat([t, t]), torch.cat([conditioning_vec, uncond_vec])
+                )
+                cond, uncond = velocity.chunk(2)
+                return uncond + scale * (cond - uncond)
 
         num_steps = self.config.num_integration_steps
         time_grid = torch.linspace(0, 1, num_steps + 1, device=device)
