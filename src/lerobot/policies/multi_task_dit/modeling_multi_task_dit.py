@@ -515,6 +515,7 @@ class RoPEAttention(nn.Module):
         dropout: float = 0.0,
         max_seq_len: int = 512,
         rope_base: float = 10000.0,
+        qk_norm: bool = False,
     ):
         super().__init__()
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
@@ -528,6 +529,10 @@ class RoPEAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.rope = RotaryPositionalEmbedding(head_dim=self.head_dim, max_seq_len=max_seq_len, base=rope_base)
+        # Per-head RMSNorm on queries and keys bounds the attention logits, which otherwise grow with the
+        # weights until softmax saturates and a training step diverges.
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape  # noqa: N806
@@ -537,7 +542,7 @@ class RoPEAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q, k = self.rope(q, k)
+        q, k = self.rope(self.q_norm(q), self.k_norm(k))
 
         attn_out = torch.nn.functional.scaled_dot_product_attention(
             q,
@@ -562,6 +567,7 @@ class TransformerBlock(nn.Module):
         use_rope: bool = False,
         max_seq_len: int = 512,
         rope_base: float = 10000.0,
+        qk_norm: bool = False,
     ):
         super().__init__()
         self.use_rope = use_rope
@@ -573,6 +579,7 @@ class TransformerBlock(nn.Module):
                 dropout=dropout,
                 max_seq_len=max_seq_len,
                 rope_base=rope_base,
+                qk_norm=qk_norm,
             )
         else:
             self.multihead_attn = nn.MultiheadAttention(
@@ -662,6 +669,7 @@ class DiffusionTransformer(nn.Module):
                     use_rope=self.use_rope,
                     max_seq_len=self.horizon,
                     rope_base=config.rope_base,
+                    qk_norm=config.use_qk_norm,
                 )
                 for _ in range(self.num_layers)
             ]

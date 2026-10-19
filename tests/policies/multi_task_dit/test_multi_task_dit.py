@@ -920,3 +920,32 @@ def test_flow_matching_guided_select_action():
     with torch.no_grad():
         action = policy.select_action(preprocessor(create_observation_batch()))
     assert action.shape == (2, 10)
+
+
+@pytest.mark.parametrize("qk_norm", [False, True])
+def test_qk_norm_makes_attention_invariant_to_query_key_scale(qk_norm: bool):
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import RoPEAttention
+
+    attn = RoPEAttention(hidden_size=64, num_heads=4, max_seq_len=16, qk_norm=qk_norm).eval()
+    x = torch.randn(2, 16, 64)
+    before = attn(x)
+    with torch.no_grad():
+        attn.qkv_proj.weight[:128] *= 100.0  # queries and keys only
+        attn.qkv_proj.bias[:128] *= 100.0
+    after = attn(x)
+
+    # With qk-norm the logits are bounded and the output barely moves; without it softmax saturates.
+    assert torch.allclose(before, after, atol=1e-3) == qk_norm
+
+
+def test_qk_norm_policy_trains_and_round_trips(tmp_path):
+    import copy
+
+    config = create_grn_config(use_qk_norm=True)
+    policy = MultiTaskDiTPolicy(config=config)
+    # The batch helper switches the config to IDENTITY normalization, which GRN rejects on reload.
+    loss, _ = policy.forward(create_processed_train_batch(copy.deepcopy(config)))
+    assert torch.isfinite(loss)
+    policy.save_pretrained(tmp_path)
+    loaded = MultiTaskDiTPolicy.from_pretrained(tmp_path)
+    assert isinstance(loaded.noise_predictor.transformer_blocks[0].attn.q_norm, torch.nn.RMSNorm)

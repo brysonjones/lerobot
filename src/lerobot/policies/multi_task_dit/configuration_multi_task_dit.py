@@ -92,6 +92,7 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     timestep_embed_dim: int = 256  # Timestep embedding dimension
     use_rope: bool = True  # Use Rotary Position Embedding
     rope_base: float = 10000.0  # RoPE base frequency
+    use_qk_norm: bool = False  # RMSNorm on per-head queries and keys (RoPE only); stabilizes training
 
     # Vision Encoder (CLIP)
     vision_encoder_name: str = "openai/clip-vit-base-patch16"  # HuggingFace CLIP model
@@ -166,6 +167,8 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             raise ValueError("num_heads must be positive")
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
+        if self.use_qk_norm and not self.use_rope:
+            raise ValueError("use_qk_norm is implemented for the RoPE attention path only")
         if not (0.0 <= self.dropout <= 1.0):
             raise ValueError("dropout must be between 0.0 and 1.0")
 
