@@ -815,3 +815,59 @@ def test_grn_policy_save_and_load(tmp_path):
     assert loaded.config.objective == "grn"
     for key, value in policy.state_dict().items():
         assert torch.equal(value, loaded.state_dict()[key]), key
+
+
+class _ConstantLogits(torch.nn.Module):
+    """Stub denoiser: per-sample constant logits, counting calls."""
+
+    def __init__(self, logit_one: Tensor):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.logit_one = logit_one
+        self.calls = 0
+
+    def forward(self, canvas, level, conditioning_vec):
+        self.calls += 1
+        logits = torch.zeros(*canvas.shape, 2)
+        logits[..., 1] = self.logit_one[: canvas.shape[0], None, None]
+        return logits
+
+
+def test_grn_adaptive_steps_with_a_fixed_budget():
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import GRNObjective
+
+    config = create_grn_config(
+        action_dim=3, grn_num_refine_steps=50, grn_adaptive_steps=True, grn_adaptive_k=0.0, grn_adaptive_b=12
+    )
+    objective = GRNObjective(config, action_dim=3, horizon=16)
+    model = _ConstantLogits(torch.full((4,), 100.0))
+
+    actions = objective.conditional_sample(model, batch_size=4, conditioning_vec=torch.zeros(4, 1))
+
+    # Warmup (5) plus k * H + b (12) passes.
+    assert model.calls == 17
+    assert objective.last_num_steps.tolist() == [17.0] * 4
+    assert torch.allclose(actions, torch.full_like(actions, 1 - 2**-config.grn_action_bits))
+
+
+def test_grn_adaptive_steps_follow_prediction_entropy():
+    """A confident chunk (entropy 0) stops early; an uncertain one (entropy 1) refines longer."""
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import GRNObjective
+
+    config = create_grn_config(
+        action_dim=3,
+        grn_num_refine_steps=50,
+        grn_adaptive_steps=True,
+        grn_adaptive_k=30.0,
+        grn_adaptive_b=10.0,
+        grn_adaptive_min_steps=10,
+    )
+    objective = GRNObjective(config, action_dim=3, horizon=16)
+    model = _ConstantLogits(torch.tensor([100.0, 100.0, 0.0, 0.0]))
+
+    objective.conditional_sample(model, batch_size=4, conditioning_vec=torch.zeros(4, 1))
+
+    assert objective.last_entropy.tolist() == pytest.approx([0.0, 0.0, 1.0, 1.0], abs=1e-4)
+    # Warmup (5) plus 30 * H + 10 passes.
+    assert objective.last_num_steps.tolist() == [15.0, 15.0, 45.0, 45.0]
+    assert model.calls == 45

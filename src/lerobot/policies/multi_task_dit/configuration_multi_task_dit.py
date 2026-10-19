@@ -69,6 +69,14 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     grn_temperature: float = 1.0  # Softmax temperature when sampling each bit
     grn_cfg_scale: float = 1.0  # Classifier-free guidance on the task text; 1.0 disables it
     grn_cfg_min_retention: float = 0.0  # Guidance applies only from this refinement level onwards
+    # Complexity-aware sampling (paper Eq. 9, reference C2I sampler): after `grn_adaptive_warmup` passes,
+    # the mean prediction entropy H in [0, 1] sets k * H + b further passes, so a chunk takes
+    # warmup + k * H + b in total, clipped to [grn_adaptive_min_steps, grn_num_refine_steps].
+    grn_adaptive_steps: bool = False
+    grn_adaptive_warmup: int = 5
+    grn_adaptive_k: float = 0.0
+    grn_adaptive_b: float = 50.0
+    grn_adaptive_min_steps: int = 10
 
     # Probability of replacing the task text with a learned null embedding during training, which
     # classifier-free guidance needs at inference.
@@ -229,6 +237,10 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                 raise ValueError(
                     "objective='grn' quantizes actions in [-1, 1] and needs MIN_MAX normalization"
                 )
+            if self.grn_adaptive_steps and not (
+                0 < self.grn_adaptive_warmup < self.grn_adaptive_min_steps <= self.grn_num_refine_steps
+            ):
+                raise ValueError("adaptive GRN sampling needs 0 < warmup < min_steps <= grn_num_refine_steps")
             if self.grn_cfg_scale != 1.0 and self.text_dropout_prob == 0.0:
                 raise ValueError(
                     "grn_cfg_scale != 1 needs a null text embedding: train with text_dropout_prob > 0"

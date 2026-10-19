@@ -982,24 +982,54 @@ class GRNObjective(nn.Module):
         steps = self.config.grn_num_refine_steps
         shape = (batch_size, self.horizon, self.num_bits * self.action_dim)
 
+        config = self.config
         base = torch.randint(0, 2, shape, device=device)
         canvas = base
+        # Per-chunk refinement level: the fraction of the canvas taken from predictions. A chunk is done
+        # once it reaches 1; with adaptive steps chunks get there after different numbers of passes.
+        level = torch.zeros(batch_size, device=device)
+        total = torch.full((batch_size,), float(steps), device=device)
+        self.last_num_steps = torch.zeros(batch_size, device=device)
+        self.last_entropy: Tensor | None = None
         for step in range(steps):
-            level = torch.full((batch_size,), step / steps, dtype=dtype, device=device)
-            guide = uncond_vec is not None and step / steps >= self.config.grn_cfg_min_retention
+            active = level < 1.0
+            if not active.any():
+                break
+            model_level = level.to(dtype)
+            guide = uncond_vec is not None and step / steps >= config.grn_cfg_min_retention
             if guide:
                 logits = model(
                     torch.cat([canvas, canvas]),
-                    torch.cat([level, level]),
+                    torch.cat([model_level, model_level]),
                     conditioning_vec=torch.cat([conditioning_vec, uncond_vec]),
                 ).float()
                 cond, uncond = logits.chunk(2)
-                logits = uncond + self.config.grn_cfg_scale * (cond - uncond)
+                logits = uncond + config.grn_cfg_scale * (cond - uncond)
             else:
-                logits = model(canvas, level, conditioning_vec=conditioning_vec).float()
-            prob_one = torch.softmax(logits / self.config.grn_temperature, dim=-1)[..., 1]
+                cond = logits = model(canvas, model_level, conditioning_vec=conditioning_vec).float()
+
+            warmup = config.grn_adaptive_warmup
+            if config.grn_adaptive_steps and step == warmup:
+                prob = cond.softmax(dim=-1)
+                self.last_entropy = -(prob * prob.clamp_min(1e-12).log2()).sum(dim=-1).mean(dim=(1, 2))
+                total = (
+                    warmup
+                    + (config.grn_adaptive_k * self.last_entropy + config.grn_adaptive_b)
+                    .clamp(config.grn_adaptive_min_steps - warmup, steps - warmup)
+                    .round()
+                )
+            if config.grn_adaptive_steps and step >= warmup:
+                next_level = warmup / steps + (1 - warmup / steps) * (step + 1 - warmup) / (total - warmup)
+            else:
+                next_level = torch.full_like(level, (step + 1) / steps)
+            next_level = torch.where(next_level > 1 - 1e-6, torch.ones_like(next_level), next_level)
+
+            prob_one = torch.softmax(logits / config.grn_temperature, dim=-1)[..., 1]
             prediction = (torch.rand_like(prob_one) < prob_one).long()
-            keep = torch.rand(shape, device=device) < (step + 1) / steps
-            canvas = torch.where(keep, prediction, base)
+            keep = torch.rand(shape, device=device) < next_level[:, None, None]
+            refined = torch.where(keep, prediction, base)
+            canvas = torch.where(active[:, None, None], refined, canvas)
+            level = torch.where(active, next_level, level)
+            self.last_num_steps += active
 
         return bits_to_actions(canvas, self.num_bits).to(dtype)
