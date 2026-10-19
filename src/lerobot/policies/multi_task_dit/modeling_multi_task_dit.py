@@ -17,12 +17,13 @@
 """Multi-Task Diffusion Transformer (DiT) Policy
 
 Transformer-based diffusion policy for multi-task robot learning with text and vision conditioning.
-Supports both diffusion and flow matching objectives for action generation.
+Supports diffusion, flow matching and generative refinement (GRN) objectives for action generation.
 
 References:
 - https://arxiv.org/abs/2507.05331
 - https://bostondynamics.com/blog/large-behavior-models-atlas-find-new-footing/
 - https://brysonkjones.substack.com/p/dissecting-and-open-sourcing-multitask-diffusion-transformer-policy
+- https://arxiv.org/abs/2604.13030 (Generative Refinement Networks)
 """
 
 import math
@@ -105,6 +106,13 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 horizon=horizon,
                 do_mask_loss_for_padding=config.do_mask_loss_for_padding,
             )
+        elif config.is_grn:
+            self.objective = GRNObjective(
+                config,
+                action_dim=action_dim,
+                horizon=horizon,
+                do_mask_loss_for_padding=config.do_mask_loss_for_padding,
+            )
         else:
             raise ValueError(f"Unsupported objective: {config.objective}")
 
@@ -137,7 +145,15 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         assert n_obs_steps == self.config.n_obs_steps
 
         conditioning_vec = self.observation_encoder.encode(batch)
-        actions = self.objective.conditional_sample(self.noise_predictor, batch_size, conditioning_vec)
+        if isinstance(self.objective, GRNObjective) and self.config.grn_cfg_scale != 1.0:
+            actions = self.objective.conditional_sample(
+                self.noise_predictor,
+                batch_size,
+                conditioning_vec,
+                uncond_vec=self.observation_encoder.drop_text(conditioning_vec),
+            )
+        else:
+            actions = self.objective.conditional_sample(self.noise_predictor, batch_size, conditioning_vec)
 
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
@@ -199,6 +215,10 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         conditioning_vec = self.observation_encoder.encode(batch)
         loss = self.objective.compute_loss(self.noise_predictor, batch, conditioning_vec)
 
+        if self.config.is_grn:
+            # One device-to-host copy for all of them; the trainer already syncs on the loss.
+            accuracy = self.objective.plane_accuracy.tolist()
+            return loss, {f"bit_acc_plane{i}": acc for i, acc in enumerate(accuracy)}
         return loss, None
 
 
@@ -305,6 +325,9 @@ class ObservationEncoder(nn.Module):
 
         self.text_dim = config.hidden_dim
         self.text_encoder = CLIPTextEncoder(model_name=config.text_encoder_name, projection_dim=self.text_dim)
+        # Learned stand-in for "no task text", for classifier-free guidance. Only created when used, so
+        # checkpoints trained without it keep loading.
+        self.null_text = nn.Parameter(torch.zeros(self.text_dim)) if config.text_dropout_prob > 0 else None
 
         self._setup_vector_output()
 
@@ -397,11 +420,21 @@ class ObservationEncoder(nn.Module):
             if row_index is not None:
                 text_features = text_features[row_index]
 
+            if self.training and self.null_text is not None:
+                drop = torch.rand(batch_size, 1, device=text_features.device) < self.config.text_dropout_prob
+                text_features = torch.where(drop, self.null_text.to(text_features.dtype), text_features)
+
             text_features = text_features.unsqueeze(1).expand(-1, n_obs_steps, -1)
             conditioning_feats.append(text_features)
 
         combined_features = torch.cat(conditioning_feats, dim=-1)
         return combined_features.flatten(start_dim=1)
+
+    def drop_text(self, conditioning_vec: Tensor) -> Tensor:
+        """Replace the task text in an encoded conditioning vector with the learned null embedding."""
+        per_step = conditioning_vec.unflatten(1, (self.config.n_obs_steps, -1)).clone()
+        per_step[..., -self.text_dim :] = self.null_text.to(per_step.dtype)
+        return per_step.flatten(start_dim=1)
 
 
 # -- Transformer Components --
@@ -601,7 +634,13 @@ class DiffusionTransformer(nn.Module):
         )
 
         self.cond_dim = self.timestep_embed_dim + conditioning_dim
-        self.input_proj = nn.Linear(self.action_dim, self.hidden_size)
+        # GRN reads and predicts a canvas of action bits instead of continuous actions.
+        self.is_grn = config.is_grn
+        self.num_bits = self.action_dim * config.grn_action_bits if self.is_grn else 0
+        if self.is_grn:
+            self.input_proj = nn.Linear(2 * self.num_bits, self.hidden_size)
+        else:
+            self.input_proj = nn.Linear(self.action_dim, self.hidden_size)
 
         if config.use_positional_encoding:
             self.pos_embedding = nn.Parameter(
@@ -625,7 +664,14 @@ class DiffusionTransformer(nn.Module):
             ]
         )
 
-        self.output_proj = nn.Linear(self.hidden_size, self.action_dim)
+        if self.is_grn:
+            # Final AdaLN norm before zero-initialized logits, as in GRN's (and DiT's) final layer: the
+            # cross-entropy logits need a normalized, condition-modulated input to stay well scaled.
+            self.final_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+            self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(self.cond_dim, 2 * self.hidden_size))
+            self.output_proj = nn.Linear(self.hidden_size, 2 * self.num_bits)
+        else:
+            self.output_proj = nn.Linear(self.hidden_size, self.action_dim)
         self._initialize_weights()
         if config.compile_model:
             # Compiled the same way as CLIPVisionEncoder, for the same reasons.
@@ -635,6 +681,10 @@ class DiffusionTransformer(nn.Module):
         for block in self.transformer_blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        if self.is_grn:
+            for layer in (self.final_modulation[-1], self.output_proj):
+                nn.init.constant_(layer.weight, 0)
+                nn.init.constant_(layer.bias, 0)
 
     def forward(self, x: Tensor, timestep: Tensor, conditioning_vec: Tensor) -> Tensor:
         _, seq_len, _ = x.shape
@@ -642,6 +692,8 @@ class DiffusionTransformer(nn.Module):
         timestep_features = self.time_mlp(timestep)
         cond_features = torch.cat([timestep_features, conditioning_vec], dim=-1)
 
+        if self.is_grn:
+            x = F.one_hot(x, 2).flatten(start_dim=2).to(self.input_proj.weight.dtype)
         hidden_seq = self.input_proj(x)
 
         if self.pos_embedding is not None:
@@ -650,6 +702,10 @@ class DiffusionTransformer(nn.Module):
         for block in self.transformer_blocks:
             hidden_seq = block(hidden_seq, cond_features)
 
+        if self.is_grn:
+            shift, scale = self.final_modulation(cond_features).chunk(2, dim=-1)
+            hidden_seq = modulate(self.final_norm(hidden_seq), shift.unsqueeze(1), scale.unsqueeze(1))
+            return self.output_proj(hidden_seq).unflatten(-1, (self.num_bits, 2))
         return self.output_proj(hidden_seq)
 
 
@@ -836,3 +892,114 @@ class FlowMatchingObjective(nn.Module):
             x = x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
 
         return x
+
+
+def actions_to_bits(actions: Tensor, num_bits: int) -> Tensor:
+    """Quantize normalized actions into Hierarchical Binary Quantization bits (arXiv 2604.13030, Alg. 1).
+
+    Bit `m` of a dimension answers "is the value above the centre of its current interval?" and halves
+    the interval, so the bits run coarse to fine and the reconstruction error is at most `2**-num_bits`.
+
+    Args:
+        actions (`torch.Tensor`): `[..., action_dim]`, normalized to `[-1, 1]` (clamped if outside).
+        num_bits (`int`): Bits per action dimension.
+
+    Returns:
+        `torch.Tensor`: `[..., num_bits * action_dim]` long tensor of 0/1, bit planes outermost.
+    """
+    values = actions.clamp(-1.0, 1.0)
+    center = torch.zeros_like(values)
+    planes = []
+    for plane in range(num_bits):
+        bit = values > center
+        planes.append(bit)
+        center = center + torch.where(bit, 0.5 ** (plane + 1), -(0.5 ** (plane + 1)))
+    return torch.cat(planes, dim=-1).long()
+
+
+def bits_to_actions(bits: Tensor, num_bits: int) -> Tensor:
+    """Inverse of `actions_to_bits`: `[..., num_bits * action_dim]` bits to `[..., action_dim]` actions."""
+    planes = bits.unflatten(-1, (num_bits, -1)).float() * 2 - 1
+    weights = 0.5 ** torch.arange(1, num_bits + 1, device=bits.device, dtype=planes.dtype)
+    return (planes * weights[:, None]).sum(dim=-2)
+
+
+class GRNObjective(nn.Module):
+    """Generative Refinement Networks objective (arXiv 2604.13030) over action bits.
+
+    Training mixes the clean bit canvas with uniformly random bits at a sampled retention level and asks
+    the model for the complete clean canvas, with cross-entropy at every position. Sampling starts from one
+    random canvas that stays fixed for the whole trajectory; each pass predicts every bit, keeps a freshly
+    drawn random subset of the predictions (growing from 1/T to all of them) and reverts the rest to the
+    fixed canvas. Because the kept subset is redrawn every pass, earlier predictions can be erased and
+    redone. Freezing it (MaskGIT) or choosing it by confidence both break sampling, per the paper's
+    ablations (Tab. 7, Tab. 11).
+    """
+
+    def __init__(self, config, action_dim: int, horizon: int, do_mask_loss_for_padding: bool = False):
+        super().__init__()
+        self.config = config
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.num_bits = config.grn_action_bits
+        self.do_mask_loss_for_padding = do_mask_loss_for_padding
+        self.plane_accuracy = torch.zeros(self.num_bits)
+
+    def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
+        target = actions_to_bits(batch[ACTION], self.num_bits)
+        batch_size = target.shape[0]
+        noise = torch.randn(batch_size, device=target.device)
+        # The nominal level conditions the model, not the realized keep fraction, as in the released code.
+        retention = torch.sigmoid(noise * self.config.grn_retention_p_std + self.config.grn_retention_p_mean)
+        keep = torch.rand(target.shape, device=target.device) < retention[:, None, None]
+        canvas = torch.where(keep, target, torch.randint_like(target, 2))
+
+        logits = model(canvas, retention, conditioning_vec=conditioning_vec)
+        loss = F.cross_entropy(logits.float().flatten(0, 2), target.flatten(), reduction="none")
+        loss = loss.view_as(target)
+
+        with torch.no_grad():
+            correct = (logits.argmax(dim=-1) == target).float()
+            self.plane_accuracy = correct.unflatten(-1, (self.num_bits, -1)).mean(dim=(0, 1, 3))
+
+        if self.do_mask_loss_for_padding and "action_is_pad" in batch:
+            mask = ~batch["action_is_pad"].unsqueeze(-1)
+            num_valid = mask.sum() * loss.shape[-1]
+            return (loss * mask).sum() / num_valid.clamp_min(1)
+
+        return loss.mean()
+
+    @torch.no_grad()
+    def conditional_sample(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        conditioning_vec: Tensor,
+        uncond_vec: Tensor | None = None,
+    ) -> Tensor:
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+        steps = self.config.grn_num_refine_steps
+        shape = (batch_size, self.horizon, self.num_bits * self.action_dim)
+
+        base = torch.randint(0, 2, shape, device=device)
+        canvas = base
+        for step in range(steps):
+            level = torch.full((batch_size,), step / steps, dtype=dtype, device=device)
+            guide = uncond_vec is not None and step / steps >= self.config.grn_cfg_min_retention
+            if guide:
+                logits = model(
+                    torch.cat([canvas, canvas]),
+                    torch.cat([level, level]),
+                    conditioning_vec=torch.cat([conditioning_vec, uncond_vec]),
+                ).float()
+                cond, uncond = logits.chunk(2)
+                logits = uncond + self.config.grn_cfg_scale * (cond - uncond)
+            else:
+                logits = model(canvas, level, conditioning_vec=conditioning_vec).float()
+            prob_one = torch.softmax(logits / self.config.grn_temperature, dim=-1)[..., 1]
+            prediction = (torch.rand_like(prob_one) < prob_one).long()
+            keep = torch.rand(shape, device=device) < (step + 1) / steps
+            canvas = torch.where(keep, prediction, base)
+
+        return bits_to_actions(canvas, self.num_bits).to(dtype)

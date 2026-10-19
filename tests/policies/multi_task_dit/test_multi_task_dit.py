@@ -681,3 +681,137 @@ def test_multi_task_dit_compiled_policy_save_and_load(tmp_path):
     # The eager reload is the reference: the compiled policy and the compiled reload must match it.
     torch.testing.assert_close(losses[0], losses[2], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(losses[1], losses[2], rtol=1e-5, atol=1e-5)
+
+
+# -- GRN objective --
+
+
+def create_grn_config(action_dim: int = 10, **overrides) -> MultiTaskDiTConfig:
+    config = create_config(action_dim=action_dim)
+    for key, value in {"objective": "grn", "grn_num_refine_steps": 4, **overrides}.items():
+        setattr(config, key, value)
+    config.__post_init__()
+    return config
+
+
+@pytest.mark.parametrize("num_bits", [1, 4, 8])
+def test_grn_bits_round_trip_within_quantization_bound(num_bits: int):
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import actions_to_bits, bits_to_actions
+
+    actions = torch.rand(3, 16, 7) * 2 - 1
+    bits = actions_to_bits(actions, num_bits)
+
+    assert bits.shape == (3, 16, 7 * num_bits)
+    assert set(bits.unique().tolist()) <= {0, 1}
+    assert (bits_to_actions(bits, num_bits) - actions).abs().max() <= 2**-num_bits + 1e-6
+    # The first plane is the sign: coarse to fine.
+    assert torch.equal(bits[..., :7].bool(), actions > 0)
+
+
+def test_grn_bits_match_reference_hbq():
+    """0.68 -> [1, 1, 0, 1] -> 0.6875 at four rounds, as the official HBQ utility produces."""
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import actions_to_bits, bits_to_actions
+
+    bits = actions_to_bits(torch.tensor([[0.68]]), 4)
+
+    assert bits.tolist() == [[1, 1, 0, 1]]
+    assert bits_to_actions(bits, 4).item() == pytest.approx(0.6875)
+
+
+def test_grn_policy_forward_and_select_action():
+    config = create_grn_config()
+    policy = MultiTaskDiTPolicy(config=config)
+    policy.train()
+
+    loss, metrics = policy.forward(create_processed_train_batch(config))
+
+    assert torch.isfinite(loss)
+    assert sorted(metrics) == [f"bit_acc_plane{i}" for i in range(config.grn_action_bits)]
+    assert all(0.0 <= acc <= 1.0 for acc in metrics.values())
+    loss.backward()
+    assert policy.noise_predictor.output_proj.weight.grad is not None
+
+    policy.eval()
+    preprocessor, _ = make_multi_task_dit_pre_post_processors(config=config, dataset_stats=None)
+    with torch.no_grad():
+        action = policy.select_action(preprocessor(create_observation_batch()))
+    assert action.shape == (2, 10)
+    assert action.abs().max() <= 1.0
+
+
+def test_grn_sampler_redraws_the_keep_mask_and_returns_the_last_prediction():
+    """Kept predictions can revert to the fixed base canvas (erase), and the last pass keeps everything."""
+    from lerobot.policies.multi_task_dit.modeling_multi_task_dit import GRNObjective
+
+    config = create_grn_config(action_dim=3, grn_num_refine_steps=8)
+    objective = GRNObjective(config, action_dim=3, horizon=16)
+    canvases = []
+
+    class AlwaysOne(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, canvas, level, conditioning_vec):
+            canvases.append(canvas.clone())
+            logits = torch.zeros(*canvas.shape, 2)
+            logits[..., 1] = 100.0
+            return logits
+
+    actions = objective.conditional_sample(AlwaysOne(), batch_size=64, conditioning_vec=torch.zeros(64, 1))
+
+    erased = [
+        ((before == 1) & (after == 0)).any()
+        for before, after in zip(canvases[:-1], canvases[1:], strict=True)
+    ]
+    assert any(erased)
+    assert torch.allclose(actions, torch.full_like(actions, 1 - 2**-config.grn_action_bits))
+
+
+def test_grn_text_dropout_and_guidance():
+    config = create_grn_config(text_dropout_prob=0.5, grn_cfg_scale=2.0)
+    policy = MultiTaskDiTPolicy(config=config)
+    batch = policy._prepare_batch(create_processed_train_batch(config))
+
+    conditioning = policy.observation_encoder.encode(batch)
+    dropped = policy.observation_encoder.drop_text(conditioning)
+    text_dim = policy.observation_encoder.text_dim
+    per_step = dropped.unflatten(1, (config.n_obs_steps, -1))
+    assert torch.equal(per_step[..., -text_dim:], torch.zeros_like(per_step[..., -text_dim:]))
+    assert torch.equal(
+        per_step[..., :-text_dim], conditioning.unflatten(1, (config.n_obs_steps, -1))[..., :-text_dim]
+    )
+
+    policy.eval()
+    preprocessor, _ = make_multi_task_dit_pre_post_processors(config=config, dataset_stats=None)
+    with torch.no_grad():
+        action = policy.select_action(preprocessor(create_observation_batch()))
+    assert action.shape == (2, 10)
+
+
+def test_grn_guidance_requires_text_dropout():
+    with pytest.raises(ValueError, match="text_dropout_prob"):
+        create_grn_config(grn_cfg_scale=2.0)
+
+
+def test_grn_requires_min_max_action_normalization():
+    with pytest.raises(ValueError, match="MIN_MAX"):
+        create_grn_config(
+            normalization_mapping={
+                "VISUAL": NormalizationMode.MEAN_STD,
+                "STATE": NormalizationMode.MIN_MAX,
+                "ACTION": NormalizationMode.MEAN_STD,
+            }
+        )
+
+
+def test_grn_policy_save_and_load(tmp_path):
+    config = create_grn_config(text_dropout_prob=0.1)
+    policy = MultiTaskDiTPolicy(config=config)
+    policy.save_pretrained(tmp_path)
+
+    loaded = MultiTaskDiTPolicy.from_pretrained(tmp_path)
+
+    assert loaded.config.objective == "grn"
+    for key, value in policy.state_dict().items():
+        assert torch.equal(value, loaded.state_dict()[key]), key
